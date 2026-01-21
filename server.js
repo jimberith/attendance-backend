@@ -40,7 +40,7 @@ const SubjectSchema = new mongoose.Schema({
 const AttendanceSchema = new mongoose.Schema({
   email: { type: String, required: true },
   className: { type: String, required: true },
-  date: { type: String, required: true }, // YYYY-MM-DD
+  date: { type: String, required: true },
   status: { type: String, enum: ["Present", "Absent"], required: true }
 }, { timestamps: true });
 
@@ -60,7 +60,7 @@ const Attendance = mongoose.model("Attendance", AttendanceSchema);
 const Marks = mongoose.model("Marks", MarksSchema);
 
 // =========================
-// Helpers
+// Auth helpers
 // =========================
 function createToken(user) {
   return jwt.sign(
@@ -174,10 +174,11 @@ app.get("/me", auth, async (req, res) => {
   res.json({ success: true, user });
 });
 
-// ✅ Owner: Add Student User
+// ✅ Owner: Add Student
 app.post("/owner/add-user", auth, onlyOwner, async (req, res) => {
   try {
     const { name, email, password } = req.body;
+
     if (!name || !email || !password)
       return res.status(400).json({ success: false, message: "Missing fields" });
 
@@ -193,19 +194,23 @@ app.post("/owner/add-user", auth, onlyOwner, async (req, res) => {
       role: "student"
     });
 
-    res.json({ success: true, message: "Student added ✅", user: { name: user.name, email: user.email } });
+    res.json({
+      success: true,
+      message: "Student added ✅",
+      user: { name: user.name, email: user.email, role: user.role }
+    });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
 });
 
-// ✅ Owner: List users
+// ✅ Owner: List Users
 app.get("/owner/users", auth, onlyOwner, async (req, res) => {
   const users = await User.find().select("-passwordHash").sort({ createdAt: -1 });
   res.json({ success: true, users });
 });
 
-// ✅ Owner: Add class
+// ✅ Owner: Add Class
 app.post("/owner/class", auth, onlyOwner, async (req, res) => {
   try {
     const { name } = req.body;
@@ -218,7 +223,7 @@ app.post("/owner/class", auth, onlyOwner, async (req, res) => {
   }
 });
 
-// ✅ Owner: Add subject
+// ✅ Owner: Add Subject
 app.post("/owner/subject", auth, onlyOwner, async (req, res) => {
   try {
     const { name } = req.body;
@@ -231,13 +236,13 @@ app.post("/owner/subject", auth, onlyOwner, async (req, res) => {
   }
 });
 
-// ✅ Get classes
+// ✅ Get Classes
 app.get("/classes", auth, async (req, res) => {
   const classes = await ClassModel.find().sort({ name: 1 });
   res.json({ success: true, classes });
 });
 
-// ✅ Get subjects
+// ✅ Get Subjects
 app.get("/subjects", auth, async (req, res) => {
   const subjects = await SubjectModel.find().sort({ name: 1 });
   res.json({ success: true, subjects });
@@ -261,7 +266,7 @@ app.post("/enroll", auth, async (req, res) => {
   }
 });
 
-// ✅ Owner mark attendance
+// ✅ Owner mark attendance (safe)
 app.post("/owner/attendance", auth, onlyOwner, async (req, res) => {
   try {
     const { email, className, status, date } = req.body;
@@ -272,7 +277,7 @@ app.post("/owner/attendance", auth, onlyOwner, async (req, res) => {
     res.json({ success: true, message: "Attendance saved ✅", record: rec });
   } catch (err) {
     if (String(err.message).includes("duplicate key")) {
-      return res.json({ success: false, message: "Attendance already marked for this student today" });
+      return res.json({ success: false, message: "Attendance already marked for today" });
     }
     res.status(500).json({ success: false, message: err.message });
   }
@@ -311,7 +316,7 @@ app.get("/marks", auth, async (req, res) => {
   res.json({ success: true, records });
 });
 
-// ✅ Update profile
+// ✅ Update Profile
 app.post("/profile", auth, async (req, res) => {
   try {
     const { name, password } = req.body;
