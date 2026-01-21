@@ -9,12 +9,12 @@ dotenv.config();
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "5mb" })); // for profile image base64
 
 const JWT_SECRET = process.env.JWT_SECRET || "CHANGE_THIS_SECRET_NOW";
 
-// ✅ MongoDB Connection
-mongoose.connect(process.env.MONGO_URI)
+// ✅ Mongo connect
+mongoose.connect(process.env.MONGO_URI, { serverSelectionTimeoutMS: 15000 })
   .then(() => console.log("✅ MongoDB Connected"))
   .catch(err => console.log("❌ MongoDB Error:", err.message));
 
@@ -24,9 +24,19 @@ mongoose.connect(process.env.MONGO_URI)
 const UserSchema = new mongoose.Schema({
   name: { type: String, required: true },
   email: { type: String, unique: true, required: true },
+  rollNumber: { type: String, unique: true, required: true },
+
   passwordHash: { type: String, required: true },
   role: { type: String, enum: ["owner", "student"], required: true },
-  enrolledClass: { type: String, default: null }
+
+  enrolledClass: { type: String, default: null },
+
+  // Profile fields
+  gender: { type: String, enum: ["Male", "Female", "Other", ""], default: "" },
+  phone: { type: String, default: "" },
+  dob: { type: String, default: "" }, // YYYY-MM-DD
+  address: { type: String, default: "" },
+  profilePic: { type: String, default: "" } // base64
 }, { timestamps: true });
 
 const ClassSchema = new mongoose.Schema({
@@ -38,33 +48,42 @@ const SubjectSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 const AttendanceSchema = new mongoose.Schema({
-  email: { type: String, required: true },
+  rollNumber: { type: String, required: true },
   className: { type: String, required: true },
-  date: { type: String, required: true },
-  status: { type: String, enum: ["Present", "Absent"], required: true }
+  date: { type: String, required: true }, // YYYY-MM-DD
+  status: { type: String, enum: ["Present", "Absent", "On Duty (O/D)", "Leave"], required: true }
 }, { timestamps: true });
 
 const MarksSchema = new mongoose.Schema({
-  email: { type: String, required: true },
+  rollNumber: { type: String, required: true },
   subject: { type: String, required: true },
   marks: { type: Number, required: true }
 }, { timestamps: true });
 
-AttendanceSchema.index({ email: 1, date: 1 }, { unique: true });
-MarksSchema.index({ email: 1, subject: 1 }, { unique: true });
+// one attendance per day per roll
+AttendanceSchema.index({ rollNumber: 1, date: 1 }, { unique: true });
+// one marks per subject per roll
+MarksSchema.index({ rollNumber: 1, subject: 1 }, { unique: true });
+
+// Admin settings
+const SettingsSchema = new mongoose.Schema({
+  key: { type: String, unique: true, required: true },
+  value: { type: Object, required: true }
+}, { timestamps: true });
 
 const User = mongoose.model("User", UserSchema);
 const ClassModel = mongoose.model("Class", ClassSchema);
 const SubjectModel = mongoose.model("Subject", SubjectSchema);
 const Attendance = mongoose.model("Attendance", AttendanceSchema);
 const Marks = mongoose.model("Marks", MarksSchema);
+const Settings = mongoose.model("Settings", SettingsSchema);
 
 // =========================
-// Auth helpers
+// Helpers
 // =========================
 function createToken(user) {
   return jwt.sign(
-    { email: user.email, role: user.role, id: user._id },
+    { id: user._id, role: user.role, rollNumber: user.rollNumber },
     JWT_SECRET,
     { expiresIn: "7d" }
   );
@@ -92,22 +111,40 @@ function onlyOwner(req, res, next) {
   next();
 }
 
+function safeUser(user) {
+  return {
+    name: user.name,
+    role: user.role,
+    rollNumber: user.rollNumber,
+    enrolledClass: user.enrolledClass,
+    gender: user.gender,
+    phone: user.phone,
+    dob: user.dob,
+    address: user.address,
+    profilePic: user.profilePic
+  };
+}
+
 // =========================
 // Routes
 // =========================
 app.get("/", (req, res) => {
-  res.send("✅ Secure Attendance Backend Running");
+  res.send("✅ ATTENDIFY Backend Running");
 });
 
-// ✅ Signup
+// ✅ Signup (needs name + email + roll + password)
 app.post("/signup", async (req, res) => {
   try {
-    const { name, email, password } = req.body;
-    if (!name || !email || !password)
+    const { name, email, rollNumber, password } = req.body;
+    if (!name || !email || !rollNumber || !password) {
       return res.status(400).json({ success: false, message: "Missing fields" });
+    }
 
-    const exists = await User.findOne({ email });
-    if (exists) return res.json({ success: false, message: "User already exists" });
+    const emailExists = await User.findOne({ email });
+    if (emailExists) return res.json({ success: false, message: "Email already exists" });
+
+    const rollExists = await User.findOne({ rollNumber });
+    if (rollExists) return res.json({ success: false, message: "Roll Number already exists" });
 
     const userCount = await User.countDocuments();
     const role = userCount === 0 ? "owner" : "student";
@@ -117,9 +154,19 @@ app.post("/signup", async (req, res) => {
     const user = await User.create({
       name,
       email,
+      rollNumber,
       passwordHash,
       role
     });
+
+    // Create default date range settings (once)
+    const existing = await Settings.findOne({ key: "attendanceRange" });
+    if (!existing) {
+      await Settings.create({
+        key: "attendanceRange",
+        value: { start: "", end: "" }
+      });
+    }
 
     const token = createToken(user);
 
@@ -127,24 +174,29 @@ app.post("/signup", async (req, res) => {
       success: true,
       message: "Signup successful ✅",
       token,
-      user: {
-        name: user.name,
-        email: user.email,
-        role: user.role,
-        enrolledClass: user.enrolledClass
-      }
+      user: safeUser(user)
     });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
 });
 
-// ✅ Login
+// ✅ Login (loginId: name/email/rollNumber + password)
 app.post("/login", async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const { loginId, password } = req.body;
+    if (!loginId || !password) {
+      return res.status(400).json({ success: false, message: "Missing fields" });
+    }
 
-    const user = await User.findOne({ email });
+    const user = await User.findOne({
+      $or: [
+        { email: loginId.toLowerCase() },
+        { rollNumber: loginId },
+        { name: loginId }
+      ]
+    });
+
     if (!user) return res.json({ success: false, message: "Invalid credentials" });
 
     const ok = await bcrypt.compare(password, user.passwordHash);
@@ -156,12 +208,7 @@ app.post("/login", async (req, res) => {
       success: true,
       message: "Login successful ✅",
       token,
-      user: {
-        name: user.name,
-        email: user.email,
-        role: user.role,
-        enrolledClass: user.enrolledClass
-      }
+      user: safeUser(user)
     });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -170,26 +217,73 @@ app.post("/login", async (req, res) => {
 
 // ✅ Get current user
 app.get("/me", auth, async (req, res) => {
-  const user = await User.findOne({ email: req.user.email }).select("-passwordHash");
-  res.json({ success: true, user });
+  const user = await User.findOne({ rollNumber: req.user.rollNumber });
+  if (!user) return res.status(404).json({ success: false, message: "User not found" });
+  res.json({ success: true, user: safeUser(user) });
+});
+
+// ✅ Update profile
+app.post("/profile", auth, async (req, res) => {
+  try {
+    const { name, rollNumber, gender, phone, dob, address, password, profilePic } = req.body;
+
+    if (!name || !rollNumber) {
+      return res.status(400).json({ success: false, message: "Name + Roll required" });
+    }
+
+    // ensure new roll is unique if changed
+    const existing = await User.findOne({ rollNumber });
+    if (existing && existing.rollNumber !== req.user.rollNumber) {
+      return res.json({ success: false, message: "Roll Number already used" });
+    }
+
+    const update = {
+      name,
+      rollNumber,
+      gender: gender ?? "",
+      phone: phone ?? "",
+      dob: dob ?? "",
+      address: address ?? ""
+    };
+
+    if (profilePic) update.profilePic = profilePic;
+
+    if (password && password.length >= 4) {
+      update.passwordHash = await bcrypt.hash(password, 10);
+    }
+
+    const updated = await User.findOneAndUpdate(
+      { rollNumber: req.user.rollNumber },
+      update,
+      { new: true }
+    );
+
+    res.json({ success: true, message: "Profile updated ✅", user: safeUser(updated) });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
 });
 
 // ✅ Owner: Add Student
 app.post("/owner/add-user", auth, onlyOwner, async (req, res) => {
   try {
-    const { name, email, password } = req.body;
+    const { name, email, rollNumber, password } = req.body;
 
-    if (!name || !email || !password)
+    if (!name || !email || !rollNumber || !password)
       return res.status(400).json({ success: false, message: "Missing fields" });
 
-    const exists = await User.findOne({ email });
-    if (exists) return res.json({ success: false, message: "User already exists" });
+    const emailExists = await User.findOne({ email });
+    if (emailExists) return res.json({ success: false, message: "Email already exists" });
+
+    const rollExists = await User.findOne({ rollNumber });
+    if (rollExists) return res.json({ success: false, message: "Roll Number already exists" });
 
     const passwordHash = await bcrypt.hash(password, 10);
 
     const user = await User.create({
       name,
       email,
+      rollNumber,
       passwordHash,
       role: "student"
     });
@@ -197,20 +291,23 @@ app.post("/owner/add-user", auth, onlyOwner, async (req, res) => {
     res.json({
       success: true,
       message: "Student added ✅",
-      user: { name: user.name, email: user.email, role: user.role }
+      user: safeUser(user)
     });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
 });
 
-// ✅ Owner: List Users
+// ✅ Owner: List Users (no email sent)
 app.get("/owner/users", auth, onlyOwner, async (req, res) => {
-  const users = await User.find().select("-passwordHash").sort({ createdAt: -1 });
-  res.json({ success: true, users });
+  const users = await User.find().sort({ createdAt: -1 });
+  res.json({
+    success: true,
+    users: users.map(u => safeUser(u))
+  });
 });
 
-// ✅ Owner: Add Class
+// ✅ Owner: Add class
 app.post("/owner/class", auth, onlyOwner, async (req, res) => {
   try {
     const { name } = req.body;
@@ -223,7 +320,7 @@ app.post("/owner/class", auth, onlyOwner, async (req, res) => {
   }
 });
 
-// ✅ Owner: Add Subject
+// ✅ Owner: Add subject
 app.post("/owner/subject", auth, onlyOwner, async (req, res) => {
   try {
     const { name } = req.body;
@@ -236,44 +333,45 @@ app.post("/owner/subject", auth, onlyOwner, async (req, res) => {
   }
 });
 
-// ✅ Get Classes
+// ✅ Get classes
 app.get("/classes", auth, async (req, res) => {
   const classes = await ClassModel.find().sort({ name: 1 });
   res.json({ success: true, classes });
 });
 
-// ✅ Get Subjects
+// ✅ Get subjects
 app.get("/subjects", auth, async (req, res) => {
   const subjects = await SubjectModel.find().sort({ name: 1 });
   res.json({ success: true, subjects });
 });
 
-// ✅ Student enroll class
+// ✅ Student enroll
 app.post("/enroll", auth, async (req, res) => {
   try {
     const { className } = req.body;
     if (!className) return res.status(400).json({ success: false, message: "Missing className" });
 
     const updated = await User.findOneAndUpdate(
-      { email: req.user.email },
+      { rollNumber: req.user.rollNumber },
       { enrolledClass: className },
       { new: true }
-    ).select("-passwordHash");
+    );
 
-    res.json({ success: true, message: "Enrolled ✅", user: updated });
+    res.json({ success: true, message: "Enrolled ✅", user: safeUser(updated) });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
 });
 
-// ✅ Owner mark attendance (safe)
+// ✅ Owner mark attendance
 app.post("/owner/attendance", auth, onlyOwner, async (req, res) => {
   try {
-    const { email, className, status, date } = req.body;
-    if (!email || !className || !status || !date)
+    const { rollNumber, className, status, date } = req.body;
+
+    if (!rollNumber || !className || !status || !date)
       return res.status(400).json({ success: false, message: "Missing fields" });
 
-    const rec = await Attendance.create({ email, className, status, date });
+    const rec = await Attendance.create({ rollNumber, className, status, date });
     res.json({ success: true, message: "Attendance saved ✅", record: rec });
   } catch (err) {
     if (String(err.message).includes("duplicate key")) {
@@ -285,20 +383,19 @@ app.post("/owner/attendance", auth, onlyOwner, async (req, res) => {
 
 // ✅ Student view attendance
 app.get("/attendance", auth, async (req, res) => {
-  const email = req.user.email;
-  const records = await Attendance.find({ email }).sort({ createdAt: -1 });
+  const records = await Attendance.find({ rollNumber: req.user.rollNumber }).sort({ date: -1 });
   res.json({ success: true, records });
 });
 
 // ✅ Owner save marks
 app.post("/owner/marks", auth, onlyOwner, async (req, res) => {
   try {
-    const { email, subject, marks } = req.body;
-    if (!email || !subject || marks === undefined)
+    const { rollNumber, subject, marks } = req.body;
+    if (!rollNumber || !subject || marks === undefined)
       return res.status(400).json({ success: false, message: "Missing fields" });
 
     const updated = await Marks.findOneAndUpdate(
-      { email, subject },
+      { rollNumber, subject },
       { marks },
       { upsert: true, new: true }
     );
@@ -311,34 +408,27 @@ app.post("/owner/marks", auth, onlyOwner, async (req, res) => {
 
 // ✅ Student view marks
 app.get("/marks", auth, async (req, res) => {
-  const email = req.user.email;
-  const records = await Marks.find({ email }).sort({ createdAt: -1 });
+  const records = await Marks.find({ rollNumber: req.user.rollNumber }).sort({ createdAt: -1 });
   res.json({ success: true, records });
 });
 
-// ✅ Update Profile
-app.post("/profile", auth, async (req, res) => {
-  try {
-    const { name, password } = req.body;
-    if (!name) return res.status(400).json({ success: false, message: "Name required" });
+// ✅ Owner: Get attendance percentage range
+app.get("/owner/range", auth, onlyOwner, async (req, res) => {
+  const s = await Settings.findOne({ key: "attendanceRange" });
+  res.json({ success: true, range: s?.value || { start: "", end: "" } });
+});
 
-    const update = { name };
-    if (password && password.length >= 4) {
-      update.passwordHash = await bcrypt.hash(password, 10);
-    }
-
-    const updated = await User.findOneAndUpdate(
-      { email: req.user.email },
-      update,
-      { new: true }
-    ).select("-passwordHash");
-
-    res.json({ success: true, message: "Profile updated ✅", user: updated });
-  } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
-  }
+// ✅ Owner: Set attendance percentage range
+app.post("/owner/range", auth, onlyOwner, async (req, res) => {
+  const { start, end } = req.body;
+  const updated = await Settings.findOneAndUpdate(
+    { key: "attendanceRange" },
+    { value: { start: start || "", end: end || "" } },
+    { upsert: true, new: true }
+  );
+  res.json({ success: true, message: "Range saved ✅", range: updated.value });
 });
 
 // ✅ Start
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log("✅ Server running on port " + PORT));
