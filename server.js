@@ -52,13 +52,15 @@ async function sendMail(to, subject, text){
       subject,
       text
     });
+
+    console.log("✅ Mail sent to:", to);
   }catch(err){
     console.log("❌ Mail send failed:", err.message);
   }
 }
 
 /* ===============================
-   WHATSAPP (Twilio Optional)
+   WHATSAPP (Optional Twilio)
 ================================ */
 let twilioClient = null;
 if (process.env.TWILIO_SID && process.env.TWILIO_AUTH) {
@@ -75,6 +77,8 @@ async function sendWhatsApp(toPhone, message){
       to: `whatsapp:${toPhone}`,
       body: message
     });
+
+    console.log("✅ WhatsApp sent to:", toPhone);
   }catch(err){
     console.log("❌ WhatsApp error:", err.message);
   }
@@ -111,16 +115,19 @@ const MarksSchema = new mongoose.Schema({
   rollNumber: String,
   className: String,
   subject: String,
-  internal: { type:Number, default:0 },
-  assessment: { type:Number, default:0 },
-  exam: { type:Number, default:0 },
-  total: { type:Number, default:0 },
+
+  internal: { type:Number, default:0 },    // 0-30
+  assessment: { type:Number, default:0 }, // 0-20
+  exam: { type:Number, default:0 },       // 0-50
+
+  total: { type:Number, default:0 },      // 0-100
   gradePoint: { type:Number, default:0 }
 }, { timestamps:true });
 
 const ClassSchema = new mongoose.Schema({ name:String }, { timestamps:true });
 const SubjectSchema = new mongoose.Schema({ name:String }, { timestamps:true });
 
+/* ✅ Force collections */
 const User = mongoose.model("User", UserSchema, "users");
 const Attendance = mongoose.model("Attendance", AttendanceSchema, "attendance");
 const Marks = mongoose.model("Marks", MarksSchema, "marks");
@@ -185,19 +192,17 @@ function calcGradePoint(total){
 /* ===============================
    ROUTES
 ================================ */
-app.get("/", (req, res) => res.send("✅ ATTENDIFY Backend Running"));
+app.get("/", (req,res)=>res.send("✅ ATTENDIFY Backend Running"));
 
-/* ✅ Signup (No OTP, any email allowed) */
+/* ✅ Signup (any email allowed) */
 app.post("/signup", async (req,res)=>{
   try{
     const { name, email, rollNumber, password } = req.body;
-
     if(!name || !email || !rollNumber || !password){
       return res.status(400).json({ success:false, message:"Fill all fields" });
     }
 
     const cleanEmail = email.trim().toLowerCase();
-
     if(!isValidEmail(cleanEmail)){
       return res.json({ success:false, message:"Invalid email format" });
     }
@@ -223,14 +228,13 @@ app.post("/signup", async (req,res)=>{
     });
 
     const token = createToken(user);
-    res.json({ success:true, token, user: safeUser(user) });
-
+    res.json({ success:true, token, user:safeUser(user) });
   }catch(err){
     res.status(500).json({ success:false, message:err.message });
   }
 });
 
-/* ✅ Login (works for all existing users) */
+/* ✅ Login (existing users work) */
 app.post("/login", async (req,res)=>{
   try{
     const { loginId, password } = req.body;
@@ -252,8 +256,7 @@ app.post("/login", async (req,res)=>{
     if(!ok) return res.json({ success:false, message:"Invalid credentials" });
 
     const token = createToken(user);
-    res.json({ success:true, token, user: safeUser(user) });
-
+    res.json({ success:true, token, user:safeUser(user) });
   }catch(err){
     res.status(500).json({ success:false, message:err.message });
   }
@@ -263,7 +266,7 @@ app.post("/login", async (req,res)=>{
 app.get("/me", auth, async (req,res)=>{
   const user = await User.findOne({ rollNumber:req.user.rollNumber });
   if(!user) return res.status(404).json({ success:false, message:"User not found" });
-  res.json({ success:true, user: safeUser(user) });
+  res.json({ success:true, user:safeUser(user) });
 });
 
 /* ✅ Enroll */
@@ -276,6 +279,7 @@ app.post("/enroll", auth, async (req,res)=>{
 
   user.enrolledClass = className;
   await user.save();
+
   res.json({ success:true, user:safeUser(user) });
 });
 
@@ -289,7 +293,6 @@ app.post("/profile", auth, async (req,res)=>{
 
     if(name) user.name = name;
     if(rollNumber) user.rollNumber = rollNumber;
-
     if(gender !== undefined) user.gender = gender;
     if(phone !== undefined) user.phone = phone;
     if(dob !== undefined) user.dob = dob;
@@ -302,7 +305,6 @@ app.post("/profile", auth, async (req,res)=>{
 
     await user.save();
     res.json({ success:true, user:safeUser(user) });
-
   }catch(err){
     res.status(500).json({ success:false, message:err.message });
   }
@@ -342,7 +344,7 @@ app.get("/cgpa", auth, async (req,res)=>{
   res.json({ success:true, cgpa });
 });
 
-/* ✅ Marksheet PDF */
+/* ✅ PDF Marksheet */
 app.get("/marksheet/pdf", auth, async (req,res)=>{
   const user = await User.findOne({ rollNumber:req.user.rollNumber });
   const marks = await Marks.find({ rollNumber:req.user.rollNumber });
@@ -375,14 +377,16 @@ app.get("/marksheet/pdf", auth, async (req,res)=>{
   const cgpa = marks.length
     ? (marks.reduce((a,b)=>a+(b.gradePoint||0),0) / marks.length).toFixed(2)
     : "0.00";
-  doc.fontSize(14).text(`CGPA: ${cgpa}`, { align:"right" });
 
+  doc.fontSize(14).text(`CGPA: ${cgpa}`, { align:"right" });
   doc.end();
 });
 
 /* ===============================
-   OWNER/STAFF ROUTES
+   OWNER / STAFF ROUTES
 ================================ */
+
+/* ✅ Admin users list */
 app.get("/owner/users", auth, async (req,res)=>{
   const me = await User.findOne({ rollNumber:req.user.rollNumber });
   if(!me) return res.json({ success:false, message:"User not found" });
@@ -395,6 +399,7 @@ app.get("/owner/users", auth, async (req,res)=>{
   res.json({ success:true, users: users.map(safeUser) });
 });
 
+/* ✅ Owner add user */
 app.post("/owner/add-user", auth, async (req,res)=>{
   try{
     const me = await User.findOne({ rollNumber:req.user.rollNumber });
@@ -430,12 +435,12 @@ app.post("/owner/add-user", auth, async (req,res)=>{
     });
 
     res.json({ success:true, message:"Student added ✅" });
-
   }catch(err){
     res.status(500).json({ success:false, message:err.message });
   }
 });
 
+/* ✅ Owner add class */
 app.post("/owner/class", auth, async (req,res)=>{
   const me = await User.findOne({ rollNumber:req.user.rollNumber });
   if(!me || me.role !== "owner") return res.status(403).json({ success:false, message:"Only owner" });
@@ -450,6 +455,7 @@ app.post("/owner/class", auth, async (req,res)=>{
   res.json({ success:true, message:"Class added ✅" });
 });
 
+/* ✅ Owner add subject */
 app.post("/owner/subject", auth, async (req,res)=>{
   const me = await User.findOne({ rollNumber:req.user.rollNumber });
   if(!me || me.role !== "owner") return res.status(403).json({ success:false, message:"Only owner" });
@@ -464,7 +470,7 @@ app.post("/owner/subject", auth, async (req,res)=>{
   res.json({ success:true, message:"Subject added ✅" });
 });
 
-/* ✅ Owner assign staff role + monitor classes */
+/* ✅ Owner assign staff role + allowed classes */
 app.post("/owner/user/:rollNumber/role", auth, async (req,res)=>{
   const me = await User.findOne({ rollNumber:req.user.rollNumber });
   if(!me || me.role !== "owner"){
@@ -487,7 +493,7 @@ app.post("/owner/user/:rollNumber/role", auth, async (req,res)=>{
   res.json({ success:true, user:safeUser(user) });
 });
 
-/* ✅ Attendance by date for admin */
+/* ✅ Attendance records by class+date */
 app.post("/owner/attendance/by-date", auth, async (req,res)=>{
   const { className, date } = req.body;
 
@@ -530,7 +536,7 @@ app.post("/owner/attendance", auth, async (req,res)=>{
   res.json({ success:true, message:"Attendance saved ✅" });
 });
 
-/* ✅ Save marks + email/whatsapp notify (optional) */
+/* ✅ Save marks + optional notify */
 app.post("/owner/marks", auth, async (req,res)=>{
   const { rollNumber, className, subject, internal, assessment, exam } = req.body;
 
@@ -545,7 +551,7 @@ app.post("/owner/marks", auth, async (req,res)=>{
     return res.status(403).json({ success:false, message:"Not allowed for this class" });
   }
 
-  const total = Number(internal || 0) + Number(assessment || 0) + Number(exam || 0);
+  const total = Number(internal||0) + Number(assessment||0) + Number(exam||0);
   const gradePoint = calcGradePoint(total);
 
   const updated = await Marks.findOneAndUpdate(
@@ -554,8 +560,8 @@ app.post("/owner/marks", auth, async (req,res)=>{
     { upsert:true, new:true }
   );
 
-  // Notify student (optional)
   const student = await User.findOne({ rollNumber });
+
   if(student){
     await sendMail(
       student.email,
