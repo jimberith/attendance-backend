@@ -4,6 +4,10 @@ import mongoose from "mongoose";
 import dotenv from "dotenv";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+import nodemailer from "nodemailer";
+import crypto from "crypto";
+import PDFDocument from "pdfkit";
+import twilio from "twilio";
 
 dotenv.config();
 const app = express();
@@ -14,15 +18,58 @@ app.use(cors({
   methods: ["GET","POST","PUT","DELETE"],
   allowedHeaders: ["Content-Type","Authorization"]
 }));
-app.use(express.json({ limit: "8mb" }));
+app.use(express.json({ limit: "10mb" }));
 
 const JWT_SECRET = process.env.JWT_SECRET || "CHANGE_THIS_SECRET";
 const MONGO_URI = process.env.MONGO_URI;
 
-/* ✅ Mongo Connect */
+/* ✅ MongoDB */
 mongoose.connect(MONGO_URI, { serverSelectionTimeoutMS: 15000 })
-  .then(() => console.log("✅ MongoDB Connected to DB:", mongoose.connection.name))
+  .then(() => console.log("✅ MongoDB Connected:", mongoose.connection.name))
   .catch(err => console.log("❌ MongoDB Error:", err.message));
+
+/* ===============================
+   MAIL (Nodemailer Gmail)
+================================ */
+const transporter = nodemailer.createTransport({
+  service: "gmail",
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_APP_PASS
+  }
+});
+
+async function sendMail(to, subject, text){
+  if (!to) return;
+  await transporter.sendMail({
+    from: `"ATTENDIFY" <${process.env.EMAIL_USER}>`,
+    to,
+    subject,
+    text
+  });
+}
+
+/* ===============================
+   WHATSAPP (Twilio)
+================================ */
+let twilioClient = null;
+if (process.env.TWILIO_SID && process.env.TWILIO_AUTH) {
+  twilioClient = twilio(process.env.TWILIO_SID, process.env.TWILIO_AUTH);
+}
+
+async function sendWhatsApp(toPhone, message){
+  if(!twilioClient) return;
+  if(!toPhone) return;
+  try{
+    await twilioClient.messages.create({
+      from: process.env.TWILIO_WHATSAPP,
+      to: `whatsapp:${toPhone}`,
+      body: message
+    });
+  }catch(err){
+    console.log("❌ WhatsApp error:", err.message);
+  }
+}
 
 /* ===============================
    SCHEMAS
@@ -33,46 +80,45 @@ const UserSchema = new mongoose.Schema({
   rollNumber: String,
   passwordHash: String,
 
-  role: { type: String, default: "student" }, // owner / staff / student
-  enrolledClass: { type: String, default: null },
+  role: { type:String, default:"student" }, // owner | staff | student
+  enrolledClass: String,
 
-  // staff monitoring support
-  monitorClass: { type: String, default: null },
+  monitorClasses: { type:[String], default:[] }, // staff allowed classes
 
-  // profile fields
   gender: String,
   phone: String,
   dob: String,
   address: String,
-  profilePic: String
-}, { timestamps: true });
+  profilePic: String,
+
+  emailVerified: { type:Boolean, default:false },
+  otpHash: String,
+  otpExpiry: String
+}, { timestamps:true });
 
 const AttendanceSchema = new mongoose.Schema({
   rollNumber: String,
   className: String,
   date: String,
   status: String
-}, { timestamps: true });
-
-AttendanceSchema.index({ rollNumber: 1, className: 1, date: 1 }, { unique: true });
+}, { timestamps:true });
 
 const MarksSchema = new mongoose.Schema({
   rollNumber: String,
+  className: String,
   subject: String,
-  marks: Number
-}, { timestamps: true });
 
-MarksSchema.index({ rollNumber: 1, subject: 1 }, { unique: true });
+  internal: { type:Number, default:0 },   // 0-30
+  assessment: { type:Number, default:0 }, // 0-20
+  exam: { type:Number, default:0 },       // 0-50
+  total: { type:Number, default:0 },      // 0-100
+  gradePoint: { type:Number, default:0 }
+}, { timestamps:true });
 
-const ClassSchema = new mongoose.Schema({
-  name: { type: String, unique: true }
-}, { timestamps: true });
+const ClassSchema = new mongoose.Schema({ name:String }, { timestamps:true });
+const SubjectSchema = new mongoose.Schema({ name:String }, { timestamps:true });
 
-const SubjectSchema = new mongoose.Schema({
-  name: { type: String, unique: true }
-}, { timestamps: true });
-
-/* ✅ Force collection names */
+/* ✅ Force collections */
 const User = mongoose.model("User", UserSchema, "users");
 const Attendance = mongoose.model("Attendance", AttendanceSchema, "attendance");
 const Marks = mongoose.model("Marks", MarksSchema, "marks");
@@ -89,27 +135,29 @@ function safeUser(u){
     role: u.role,
     rollNumber: u.rollNumber,
     enrolledClass: u.enrolledClass,
-    monitorClass: u.monitorClass || "",
+
+    monitorClasses: u.monitorClasses || [],
+
     gender: u.gender || "",
     phone: u.phone || "",
     dob: u.dob || "",
     address: u.address || "",
-    profilePic: u.profilePic || ""
+    profilePic: u.profilePic || "",
+    emailVerified: u.emailVerified || false
   };
 }
 
 function createToken(u){
   return jwt.sign(
-    { id: u._id, role: u.role, rollNumber: u.rollNumber },
+    { id:u._id, role:u.role, rollNumber:u.rollNumber },
     JWT_SECRET,
-    { expiresIn: "7d" }
+    { expiresIn:"7d" }
   );
 }
 
 function auth(req, res, next){
   const header = req.headers.authorization;
   if(!header) return res.status(401).json({ success:false, message:"Missing token" });
-
   const token = header.split(" ")[1];
   if(!token) return res.status(401).json({ success:false, message:"Invalid token" });
 
@@ -121,52 +169,46 @@ function auth(req, res, next){
   }
 }
 
-function requireOwnerOrStaff(req, res, next){
-  if(req.user.role === "owner" || req.user.role === "staff") return next();
-  return res.status(403).json({ success:false, message:"Access denied" });
+function isValidEmail(email){
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 }
 
-function requireOwner(req, res, next){
-  if(req.user.role === "owner") return next();
-  return res.status(403).json({ success:false, message:"Owner only" });
+function generateOTP(){
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
+function hashOTP(otp){
+  return crypto.createHash("sha256").update(otp).digest("hex");
+}
+
+function calcGradePoint(total){
+  if(total >= 90) return 10;
+  if(total >= 80) return 9;
+  if(total >= 70) return 8;
+  if(total >= 60) return 7;
+  if(total >= 50) return 6;
+  return 0;
 }
 
 /* ===============================
    ROUTES
 ================================ */
-app.get("/", (req, res) => {
-  res.send("✅ ATTENDIFY Backend Running");
-});
+app.get("/", (req, res) => res.send("✅ ATTENDIFY Backend Running"));
 
-/* ✅ Debug DB */
-app.get("/debug/db-check", async (req, res) => {
-  try{
-    res.json({
-      success: true,
-      connectedDB: mongoose.connection.name,
-      collections: (await mongoose.connection.db.listCollections().toArray()).map(c => c.name),
-      counts: {
-        users: await User.countDocuments(),
-        attendance: await Attendance.countDocuments(),
-        marks: await Marks.countDocuments(),
-        classes: await ClassModel.countDocuments(),
-        subjects: await SubjectModel.countDocuments()
-      }
-    });
-  }catch(err){
-    res.status(500).json({ success:false, message: err.message });
-  }
-});
-
-/* ✅ Signup */
-app.post("/signup", async (req, res) => {
+/* ✅ Signup (OTP sent) */
+app.post("/signup", async (req,res)=>{
   try{
     const { name, email, rollNumber, password } = req.body;
+
     if(!name || !email || !rollNumber || !password){
-      return res.status(400).json({ success:false, message:"Fill all fields" });
+      return res.json({ success:false, message:"Fill all fields" });
     }
 
-    const emailExists = await User.findOne({ email: email.toLowerCase() });
+    const cleanEmail = email.trim().toLowerCase();
+    if(!isValidEmail(cleanEmail)){
+      return res.json({ success:false, message:"Invalid email format" });
+    }
+
+    const emailExists = await User.findOne({ email: cleanEmail });
     if(emailExists) return res.json({ success:false, message:"Email already exists" });
 
     const rollExists = await User.findOne({ rollNumber });
@@ -177,29 +219,117 @@ app.post("/signup", async (req, res) => {
 
     const passwordHash = await bcrypt.hash(password, 10);
 
-    const user = await User.create({
+    const otp = generateOTP();
+    const otpHash = hashOTP(otp);
+    const otpExpiry = new Date(Date.now() + 10*60*1000).toISOString();
+
+    await User.create({
       name,
-      email: email.toLowerCase(),
+      email: cleanEmail,
       rollNumber,
       passwordHash,
       role,
       enrolledClass: null,
-      monitorClass: null
+      monitorClasses: [],
+      emailVerified:false,
+      otpHash,
+      otpExpiry
     });
 
-    const token = createToken(user);
-    res.json({ success:true, token, user: safeUser(user) });
+    await sendMail(
+      cleanEmail,
+      "ATTENDIFY Email Verification OTP",
+      `Hello ${name},
+
+Your OTP is: ${otp}
+Expires in 10 minutes.
+
+- ATTENDIFY`
+    );
+
+    res.json({ success:true, message:"OTP sent to email ✅", rollNumber });
 
   }catch(err){
-    res.status(500).json({ success:false, message: err.message });
+    res.status(500).json({ success:false, message:err.message });
+  }
+});
+
+/* ✅ Verify OTP */
+app.post("/verify-email", async (req,res)=>{
+  try{
+    const { rollNumber, otp } = req.body;
+    if(!rollNumber || !otp) return res.json({ success:false, message:"Roll + OTP required" });
+
+    const user = await User.findOne({ rollNumber });
+    if(!user) return res.json({ success:false, message:"User not found" });
+
+    if(user.emailVerified){
+      const token = createToken(user);
+      return res.json({ success:true, token, user:safeUser(user) });
+    }
+
+    if(new Date() > new Date(user.otpExpiry)){
+      return res.json({ success:false, message:"OTP expired. Resend OTP." });
+    }
+
+    if(hashOTP(String(otp).trim()) !== user.otpHash){
+      return res.json({ success:false, message:"Invalid OTP" });
+    }
+
+    user.emailVerified = true;
+    user.otpHash = "";
+    user.otpExpiry = "";
+    await user.save();
+
+    const token = createToken(user);
+    res.json({ success:true, message:"Verified ✅", token, user:safeUser(user) });
+
+  }catch(err){
+    res.status(500).json({ success:false, message:err.message });
+  }
+});
+
+/* ✅ Resend OTP */
+app.post("/resend-otp", async (req,res)=>{
+  try{
+    const { rollNumber } = req.body;
+    if(!rollNumber) return res.json({ success:false, message:"Roll required" });
+
+    const user = await User.findOne({ rollNumber });
+    if(!user) return res.json({ success:false, message:"User not found" });
+
+    if(user.emailVerified) return res.json({ success:true, message:"Already verified ✅" });
+
+    const otp = generateOTP();
+    user.otpHash = hashOTP(otp);
+    user.otpExpiry = new Date(Date.now() + 10*60*1000).toISOString();
+    await user.save();
+
+    await sendMail(
+      user.email,
+      "ATTENDIFY OTP Resend",
+      `Hello ${user.name},
+
+Your new OTP is: ${otp}
+Expires in 10 minutes.
+
+- ATTENDIFY`
+    );
+
+    res.json({ success:true, message:"OTP resent ✅" });
+
+  }catch(err){
+    res.status(500).json({ success:false, message:err.message });
   }
 });
 
 /* ✅ Login */
-app.post("/login", async (req, res) => {
+app.post("/login", async (req,res)=>{
   try{
     const { loginId, password } = req.body;
-    if(!loginId || !password) return res.status(400).json({ success:false, message:"Fill all fields" });
+    if(!loginId || !password){
+      return res.json({ success:false, message:"Fill all fields" });
+    }
 
     const user = await User.findOne({
       $or: [
@@ -210,256 +340,387 @@ app.post("/login", async (req, res) => {
     });
 
     if(!user) return res.json({ success:false, message:"Invalid credentials" });
-    if(!user.passwordHash) return res.json({ success:false, message:"User exists but password not set in DB" });
+
+    if(!user.emailVerified){
+      return res.json({
+        success:false,
+        message:"Email not verified. Enter OTP.",
+        needsVerification:true,
+        rollNumber:user.rollNumber
+      });
+    }
 
     const ok = await bcrypt.compare(password, user.passwordHash);
     if(!ok) return res.json({ success:false, message:"Invalid credentials" });
 
     const token = createToken(user);
-    res.json({ success:true, token, user: safeUser(user) });
+    res.json({ success:true, token, user:safeUser(user) });
 
   }catch(err){
-    res.status(500).json({ success:false, message: err.message });
+    res.status(500).json({ success:false, message:err.message });
   }
 });
 
 /* ✅ Me */
-app.get("/me", auth, async (req, res) => {
-  const user = await User.findOne({ rollNumber: req.user.rollNumber });
-  if(!user) return res.status(404).json({ success:false, message:"User not found" });
-  res.json({ success:true, user: safeUser(user) });
+app.get("/me", auth, async (req,res)=>{
+  const user = await User.findOne({ rollNumber:req.user.rollNumber });
+  if(!user) return res.json({ success:false, message:"User not found" });
+  res.json({ success:true, user:safeUser(user) });
 });
 
-/* ✅ Enroll Student */
-app.post("/enroll", auth, async (req, res) => {
-  try{
-    const { className } = req.body;
-    if(!className) return res.status(400).json({ success:false, message:"Class required" });
+/* ✅ Enroll */
+app.post("/enroll", auth, async (req,res)=>{
+  const { className } = req.body;
+  if(!className) return res.json({ success:false, message:"Class required" });
 
-    const user = await User.findOne({ rollNumber: req.user.rollNumber });
-    if(!user) return res.status(404).json({ success:false, message:"User not found" });
+  const user = await User.findOne({ rollNumber:req.user.rollNumber });
+  if(!user) return res.json({ success:false, message:"User not found" });
 
-    user.enrolledClass = className;
-    await user.save();
+  user.enrolledClass = className;
+  await user.save();
 
-    res.json({ success:true, message:"Enrolled", user: safeUser(user) });
-  }catch(err){
-    res.status(500).json({ success:false, message: err.message });
-  }
+  res.json({ success:true, user:safeUser(user) });
 });
 
-/* ✅ Update Profile */
-app.post("/profile", auth, async (req, res) => {
+/* ✅ Profile update */
+app.post("/profile", auth, async (req,res)=>{
   try{
-    const user = await User.findOne({ rollNumber: req.user.rollNumber });
-    if(!user) return res.status(404).json({ success:false, message:"User not found" });
+    const user = await User.findOne({ rollNumber:req.user.rollNumber });
+    if(!user) return res.json({ success:false, message:"User not found" });
 
-    const {
-      name, rollNumber, gender, phone, dob, address, password, profilePic
-    } = req.body;
+    const { name, rollNumber, gender, phone, dob, address, profilePic, password } = req.body;
 
     if(name) user.name = name;
     if(rollNumber) user.rollNumber = rollNumber;
-    if(gender !== undefined) user.gender = gender;
-    if(phone !== undefined) user.phone = phone;
-    if(dob !== undefined) user.dob = dob;
-    if(address !== undefined) user.address = address;
-    if(profilePic !== undefined) user.profilePic = profilePic;
+    user.gender = gender ?? user.gender;
+    user.phone = phone ?? user.phone;
+    user.dob = dob ?? user.dob;
+    user.address = address ?? user.address;
+    if(profilePic) user.profilePic = profilePic;
 
-    if(password){
-      user.passwordHash = await bcrypt.hash(password, 10);
+    if(password && password.trim()){
+      user.passwordHash = await bcrypt.hash(password.trim(), 10);
     }
 
     await user.save();
-    res.json({ success:true, user: safeUser(user) });
+    res.json({ success:true, user:safeUser(user) });
+
   }catch(err){
-    res.status(500).json({ success:false, message: err.message });
+    res.status(500).json({ success:false, message:err.message });
   }
 });
 
-/* ✅ Attendance (student) */
-app.get("/attendance", auth, async (req, res) => {
-  const records = await Attendance.find({ rollNumber: req.user.rollNumber }).sort({ date: -1 });
-  res.json({ success:true, records });
-});
-
-/* ✅ Marks (student) */
-app.get("/marks", auth, async (req, res) => {
-  const records = await Marks.find({ rollNumber: req.user.rollNumber }).sort({ createdAt: -1 });
-  res.json({ success:true, records });
-});
-
-/* ✅ Get Classes */
-app.get("/classes", auth, async (req, res) => {
-  const classes = await ClassModel.find().sort({ name: 1 });
+/* ✅ Classes */
+app.get("/classes", auth, async (req,res)=>{
+  const classes = await ClassModel.find().sort({ name:1 });
   res.json({ success:true, classes });
 });
 
-/* ✅ Get Subjects */
-app.get("/subjects", auth, async (req, res) => {
-  const subjects = await SubjectModel.find().sort({ name: 1 });
+/* ✅ Subjects */
+app.get("/subjects", auth, async (req,res)=>{
+  const subjects = await SubjectModel.find().sort({ name:1 });
   res.json({ success:true, subjects });
 });
 
-/* ==========================================
-   OWNER / STAFF FEATURES
-========================================== */
+/* ✅ Student Attendance */
+app.get("/attendance", auth, async (req,res)=>{
+  const records = await Attendance.find({ rollNumber:req.user.rollNumber }).sort({ date:-1 });
+  res.json({ success:true, records });
+});
 
-/* ✅ Owner view all users */
-app.get("/owner/users", auth, requireOwner, async (req, res) => {
-  const users = await User.find().sort({ createdAt: -1 });
+/* ✅ Student Results (all segments) */
+app.get("/results", auth, async (req,res)=>{
+  const records = await Marks.find({ rollNumber:req.user.rollNumber }).sort({ updatedAt:-1 });
+  res.json({ success:true, records });
+});
+
+/* ✅ CGPA */
+app.get("/cgpa", auth, async (req,res)=>{
+  const records = await Marks.find({ rollNumber:req.user.rollNumber });
+
+  if(records.length === 0) return res.json({ success:true, cgpa:0 });
+
+  const sum = records.reduce((a,b)=>a+(b.gradePoint || 0),0);
+  const cgpa = Number((sum / records.length).toFixed(2));
+  res.json({ success:true, cgpa });
+});
+
+/* ✅ PDF Marksheet */
+app.get("/marksheet/pdf", auth, async (req,res)=>{
+  const user = await User.findOne({ rollNumber:req.user.rollNumber });
+  const marks = await Marks.find({ rollNumber:req.user.rollNumber });
+
+  res.setHeader("Content-Type", "application/pdf");
+  res.setHeader("Content-Disposition", `attachment; filename="${user.rollNumber}_marksheet.pdf"`);
+
+  const doc = new PDFDocument({ margin: 40 });
+  doc.pipe(res);
+
+  doc.fontSize(18).text("ATTENDIFY - MARKSHEET", { align:"center" });
+  doc.moveDown();
+
+  doc.fontSize(12).text(`Name: ${user.name}`);
+  doc.text(`Roll Number: ${user.rollNumber}`);
+  doc.text(`Class: ${user.enrolledClass || "-"}`);
+  doc.text(`Email: ${user.email}`);
+  doc.moveDown();
+
+  doc.fontSize(14).text("Results", { underline:true });
+  doc.moveDown(0.5);
+
+  marks.forEach(m=>{
+    doc.fontSize(12).text(
+      `${m.subject} | Internal:${m.internal}/30 | Assessment:${m.assessment}/20 | Exam:${m.exam}/50 | Total:${m.total}/100`
+    );
+  });
+
+  doc.moveDown();
+  const sumGP = marks.reduce((a,b)=>a+(b.gradePoint||0),0);
+  const cgpa = marks.length ? (sumGP / marks.length).toFixed(2) : "0.00";
+
+  doc.fontSize(14).text(`CGPA: ${cgpa}`, { align:"right" });
+  doc.end();
+});
+
+/* ===============================
+   OWNER / STAFF ROUTES
+================================ */
+
+/* ✅ Owner/Staff: users list */
+app.get("/owner/users", auth, async (req,res)=>{
+  const me = await User.findOne({ rollNumber:req.user.rollNumber });
+  if(!me) return res.json({ success:false, message:"User not found" });
+
+  if(me.role !== "owner" && me.role !== "staff"){
+    return res.status(403).json({ success:false, message:"Not allowed" });
+  }
+
+  const users = await User.find().sort({ createdAt:-1 });
   res.json({ success:true, users: users.map(safeUser) });
 });
 
-/* ✅ Owner view one user profile */
-app.get("/owner/user/:rollNumber", auth, requireOwner, async (req, res) => {
-  const u = await User.findOne({ rollNumber: req.params.rollNumber });
-  if(!u) return res.status(404).json({ success:false, message:"User not found" });
-  res.json({ success:true, user: safeUser(u) });
-});
-
-/* ✅ Owner assign role + monitorClass */
-app.post("/owner/user/:rollNumber/role", auth, requireOwner, async (req, res) => {
+/* ✅ Owner: add user directly */
+app.post("/owner/add-user", auth, async (req,res)=>{
   try{
-    const { role, monitorClass } = req.body;
-    const u = await User.findOne({ rollNumber: req.params.rollNumber });
-    if(!u) return res.status(404).json({ success:false, message:"User not found" });
-
-    if(u.role === "owner") return res.json({ success:false, message:"Cannot change owner role" });
-
-    if(!["student","staff"].includes(role)) {
-      return res.status(400).json({ success:false, message:"Role must be student/staff" });
+    const me = await User.findOne({ rollNumber:req.user.rollNumber });
+    if(!me || me.role !== "owner"){
+      return res.status(403).json({ success:false, message:"Only owner can add users" });
     }
 
-    u.role = role;
-    u.monitorClass = role === "staff" ? (monitorClass || null) : null;
-    await u.save();
-
-    res.json({ success:true, message:"Role updated", user: safeUser(u) });
-  }catch(err){
-    res.status(500).json({ success:false, message: err.message });
-  }
-});
-
-/* ✅ Owner add student */
-app.post("/owner/add-user", auth, requireOwner, async (req, res) => {
-  try{
     const { name, email, rollNumber, password } = req.body;
     if(!name || !email || !rollNumber || !password){
-      return res.status(400).json({ success:false, message:"Fill all fields" });
+      return res.json({ success:false, message:"Fill all fields" });
     }
 
-    const exists = await User.findOne({ $or: [{ email: email.toLowerCase() }, { rollNumber }] });
-    if(exists) return res.json({ success:false, message:"User already exists" });
+    const cleanEmail = email.trim().toLowerCase();
+    if(!isValidEmail(cleanEmail)){
+      return res.json({ success:false, message:"Invalid email format" });
+    }
+
+    const emailExists = await User.findOne({ email: cleanEmail });
+    if(emailExists) return res.json({ success:false, message:"Email already exists" });
+
+    const rollExists = await User.findOne({ rollNumber });
+    if(rollExists) return res.json({ success:false, message:"Roll already exists" });
 
     const passwordHash = await bcrypt.hash(password, 10);
 
-    const user = await User.create({
+    const otp = generateOTP();
+    const otpHash = hashOTP(otp);
+    const otpExpiry = new Date(Date.now() + 10*60*1000).toISOString();
+
+    await User.create({
       name,
-      email: email.toLowerCase(),
+      email: cleanEmail,
       rollNumber,
       passwordHash,
-      role: "student",
-      enrolledClass: null,
-      monitorClass: null
+      role:"student",
+      enrolledClass:null,
+      emailVerified:false,
+      otpHash,
+      otpExpiry
     });
 
-    res.json({ success:true, message:"Student added", user: safeUser(user) });
+    await sendMail(
+      cleanEmail,
+      "ATTENDIFY Account Created + OTP",
+      `Hello ${name},
+
+Your ATTENDIFY account was created by Admin.
+
+OTP: ${otp}
+Expires in 10 minutes.
+
+- ATTENDIFY`
+    );
+
+    res.json({ success:true, message:"Student added + OTP sent ✅" });
+
   }catch(err){
-    res.status(500).json({ success:false, message: err.message });
+    res.status(500).json({ success:false, message:err.message });
   }
 });
 
-/* ✅ Owner add class */
-app.post("/owner/class", auth, requireOwner, async (req, res) => {
-  try{
-    const { name } = req.body;
-    if(!name) return res.status(400).json({ success:false, message:"Class name required" });
+/* ✅ Owner: add class */
+app.post("/owner/class", auth, async (req,res)=>{
+  const me = await User.findOne({ rollNumber:req.user.rollNumber });
+  if(!me || me.role !== "owner") return res.status(403).json({ success:false, message:"Only owner" });
 
-    await ClassModel.create({ name });
-    res.json({ success:true, message:"Class added" });
-  }catch(err){
-    res.json({ success:false, message: err.message });
-  }
+  const { name } = req.body;
+  if(!name) return res.json({ success:false, message:"Class name required" });
+
+  const exists = await ClassModel.findOne({ name });
+  if(exists) return res.json({ success:false, message:"Class exists" });
+
+  await ClassModel.create({ name });
+  res.json({ success:true, message:"Class added ✅" });
 });
 
-/* ✅ Owner add subject */
-app.post("/owner/subject", auth, requireOwner, async (req, res) => {
-  try{
-    const { name } = req.body;
-    if(!name) return res.status(400).json({ success:false, message:"Subject name required" });
+/* ✅ Owner: add subject */
+app.post("/owner/subject", auth, async (req,res)=>{
+  const me = await User.findOne({ rollNumber:req.user.rollNumber });
+  if(!me || me.role !== "owner") return res.status(403).json({ success:false, message:"Only owner" });
 
-    await SubjectModel.create({ name });
-    res.json({ success:true, message:"Subject added" });
-  }catch(err){
-    res.json({ success:false, message: err.message });
-  }
+  const { name } = req.body;
+  if(!name) return res.json({ success:false, message:"Subject name required" });
+
+  const exists = await SubjectModel.findOne({ name });
+  if(exists) return res.json({ success:false, message:"Subject exists" });
+
+  await SubjectModel.create({ name });
+  res.json({ success:true, message:"Subject added ✅" });
 });
 
-/* ✅ Owner mark attendance (UPSERT) */
-app.post("/owner/attendance", auth, requireOwnerOrStaff, async (req, res) => {
+/* ✅ Owner: assign role + monitor classes */
+app.post("/owner/user/:rollNumber/role", auth, async (req,res)=>{
   try{
-    const { rollNumber, className, date, status } = req.body;
-    if(!rollNumber || !className || !date || !status){
-      return res.status(400).json({ success:false, message:"Missing fields" });
+    const me = await User.findOne({ rollNumber:req.user.rollNumber });
+    if(!me || me.role !== "owner") return res.status(403).json({ success:false, message:"Only owner" });
+
+    const { role, monitorClasses } = req.body;
+
+    const user = await User.findOne({ rollNumber:req.params.rollNumber });
+    if(!user) return res.json({ success:false, message:"User not found" });
+
+    user.role = role;
+
+    if(role === "staff"){
+      user.monitorClasses = Array.isArray(monitorClasses) ? monitorClasses : [];
+    }else{
+      user.monitorClasses = [];
     }
 
-    // staff can only mark their monitorClass
-    if(req.user.role === "staff") {
-      const staffUser = await User.findOne({ rollNumber: req.user.rollNumber });
-      if(!staffUser?.monitorClass) return res.status(403).json({ success:false, message:"Staff not assigned to class" });
-      if(staffUser.monitorClass !== className) return res.status(403).json({ success:false, message:"Not allowed for this class" });
+    await user.save();
+    res.json({ success:true, user:safeUser(user) });
+
+  }catch(err){
+    res.status(500).json({ success:false, message:err.message });
+  }
+});
+
+/* ✅ Owner/Staff: attendance by date */
+app.post("/owner/attendance/by-date", auth, async (req,res)=>{
+  const { className, date } = req.body;
+
+  const me = await User.findOne({ rollNumber:req.user.rollNumber });
+  if(!me) return res.json({ success:false, message:"User not found" });
+
+  if(me.role !== "owner" && me.role !== "staff"){
+    return res.status(403).json({ success:false, message:"Not allowed" });
+  }
+
+  // staff permission check
+  if(me.role === "staff" && !me.monitorClasses.includes(className)){
+    return res.status(403).json({ success:false, message:"Staff not allowed for this class" });
+  }
+
+  const records = await Attendance.find({ className, date });
+  res.json({ success:true, records });
+});
+
+/* ✅ Owner/Staff: save attendance */
+app.post("/owner/attendance", auth, async (req,res)=>{
+  try{
+    const { rollNumber, className, status, date } = req.body;
+
+    const me = await User.findOne({ rollNumber:req.user.rollNumber });
+    if(!me) return res.json({ success:false, message:"User not found" });
+
+    if(me.role !== "owner" && me.role !== "staff"){
+      return res.status(403).json({ success:false, message:"Not allowed" });
+    }
+
+    if(me.role === "staff" && !me.monitorClasses.includes(className)){
+      return res.status(403).json({ success:false, message:"Staff not allowed for this class" });
     }
 
     await Attendance.findOneAndUpdate(
       { rollNumber, className, date },
       { rollNumber, className, date, status },
-      { upsert: true, new: true }
+      { upsert:true, new:true }
     );
 
-    res.json({ success:true, message:"Attendance saved" });
+    res.json({ success:true, message:"Attendance saved ✅" });
+
   }catch(err){
-    res.status(500).json({ success:false, message: err.message });
+    res.status(500).json({ success:false, message:err.message });
   }
 });
 
-/* ✅ Get attendance list by class+date for admin button UI */
-app.post("/owner/attendance/by-date", auth, requireOwnerOrStaff, async (req, res) => {
+/* ✅ Owner/Staff: save marks + notify */
+app.post("/owner/marks", auth, async (req,res)=>{
   try{
-    const { className, date } = req.body;
-    if(!className || !date) return res.status(400).json({ success:false, message:"Missing fields" });
+    const { rollNumber, className, subject, internal, assessment, exam } = req.body;
 
-    // staff restriction
-    if(req.user.role === "staff") {
-      const staffUser = await User.findOne({ rollNumber: req.user.rollNumber });
-      if(!staffUser?.monitorClass) return res.status(403).json({ success:false, message:"Staff not assigned to class" });
-      if(staffUser.monitorClass !== className) return res.status(403).json({ success:false, message:"Not allowed for this class" });
+    const me = await User.findOne({ rollNumber:req.user.rollNumber });
+    if(!me) return res.json({ success:false, message:"User not found" });
+
+    if(me.role !== "owner" && me.role !== "staff"){
+      return res.status(403).json({ success:false, message:"Not allowed" });
     }
 
-    const records = await Attendance.find({ className, date });
-    res.json({ success:true, records });
-  }catch(err){
-    res.status(500).json({ success:false, message: err.message });
-  }
-});
-
-/* ✅ Owner save marks (UPSERT) */
-app.post("/owner/marks", auth, requireOwner, async (req, res) => {
-  try{
-    const { rollNumber, subject, marks } = req.body;
-    if(!rollNumber || !subject || marks === undefined){
-      return res.status(400).json({ success:false, message:"Missing fields" });
+    if(me.role === "staff" && !me.monitorClasses.includes(className)){
+      return res.status(403).json({ success:false, message:"Staff not allowed for this class" });
     }
 
-    await Marks.findOneAndUpdate(
-      { rollNumber, subject },
-      { rollNumber, subject, marks },
-      { upsert: true, new: true }
+    const total = Number(internal || 0) + Number(assessment || 0) + Number(exam || 0);
+    const gradePoint = calcGradePoint(total);
+
+    const updated = await Marks.findOneAndUpdate(
+      { rollNumber, subject, className },
+      { rollNumber, className, subject, internal, assessment, exam, total, gradePoint },
+      { upsert:true, new:true }
     );
 
-    res.json({ success:true, message:"Marks saved" });
+    const student = await User.findOne({ rollNumber });
+
+    if(student && student.emailVerified){
+      await sendMail(
+        student.email,
+        `ATTENDIFY Results Updated - ${subject}`,
+        `Hello ${student.name},
+
+Your results were updated ✅
+
+Subject: ${subject}
+Internal: ${internal}/30
+Assessment: ${assessment}/20
+Exam: ${exam}/50
+Total: ${total}/100
+
+- ATTENDIFY`
+      );
+
+      await sendWhatsApp(
+        student.phone,
+        `ATTENDIFY ✅ Results Updated\n${subject}\nTotal: ${total}/100`
+      );
+    }
+
+    res.json({ success:true, updated });
+
   }catch(err){
-    res.status(500).json({ success:false, message: err.message });
+    res.status(500).json({ success:false, message:err.message });
   }
 });
 
