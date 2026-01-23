@@ -700,15 +700,6 @@ app.post("/owner/marks", auth, async (req,res)=>{
         `ATTENDIFY Results Updated - ${subject}`,
         `Hello ${student.name},
 
-Your results were updated ✅
-
-Subject: ${subject}
-Internal: ${internal}/30
-Assessment: ${assessment}/20
-Exam: ${exam}/50
-Total: ${total}/100
-
-- ATTENDIFY`
       );
 
       await sendWhatsApp(
