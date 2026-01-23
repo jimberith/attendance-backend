@@ -5,7 +5,6 @@ import dotenv from "dotenv";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import nodemailer from "nodemailer";
-import crypto from "crypto";
 import PDFDocument from "pdfkit";
 import twilio from "twilio";
 
@@ -29,28 +28,37 @@ mongoose.connect(MONGO_URI, { serverSelectionTimeoutMS: 15000 })
   .catch(err => console.log("❌ MongoDB Error:", err.message));
 
 /* ===============================
-   MAIL (Nodemailer Gmail)
+   MAIL (Optional Notifications)
 ================================ */
-const transporter = nodemailer.createTransport({
-  service: "gmail",
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_APP_PASS
-  }
-});
-
-async function sendMail(to, subject, text){
-  if (!to) return;
-  await transporter.sendMail({
-    from: `"ATTENDIFY" <${process.env.EMAIL_USER}>`,
-    to,
-    subject,
-    text
+let transporter = null;
+if (process.env.EMAIL_USER && process.env.EMAIL_APP_PASS) {
+  transporter = nodemailer.createTransport({
+    service: "gmail",
+    auth: {
+      user: process.env.EMAIL_USER,
+      pass: process.env.EMAIL_APP_PASS
+    }
   });
 }
 
+async function sendMail(to, subject, text){
+  try{
+    if(!transporter) return;
+    if(!to) return;
+
+    await transporter.sendMail({
+      from: `"ATTENDIFY" <${process.env.EMAIL_USER}>`,
+      to,
+      subject,
+      text
+    });
+  }catch(err){
+    console.log("❌ Mail send failed:", err.message);
+  }
+}
+
 /* ===============================
-   WHATSAPP (Twilio)
+   WHATSAPP (Twilio Optional)
 ================================ */
 let twilioClient = null;
 if (process.env.TWILIO_SID && process.env.TWILIO_AUTH) {
@@ -58,9 +66,10 @@ if (process.env.TWILIO_SID && process.env.TWILIO_AUTH) {
 }
 
 async function sendWhatsApp(toPhone, message){
-  if(!twilioClient) return;
-  if(!toPhone) return;
   try{
+    if(!twilioClient) return;
+    if(!toPhone) return;
+
     await twilioClient.messages.create({
       from: process.env.TWILIO_WHATSAPP,
       to: `whatsapp:${toPhone}`,
@@ -82,18 +91,13 @@ const UserSchema = new mongoose.Schema({
 
   role: { type:String, default:"student" }, // owner | staff | student
   enrolledClass: String,
-
-  monitorClasses: { type:[String], default:[] }, // staff allowed classes
+  monitorClasses: { type:[String], default:[] },
 
   gender: String,
   phone: String,
   dob: String,
   address: String,
-  profilePic: String,
-
-  emailVerified: { type:Boolean, default:false },
-  otpHash: String,
-  otpExpiry: String
+  profilePic: String
 }, { timestamps:true });
 
 const AttendanceSchema = new mongoose.Schema({
@@ -107,18 +111,16 @@ const MarksSchema = new mongoose.Schema({
   rollNumber: String,
   className: String,
   subject: String,
-
-  internal: { type:Number, default:0 },   // 0-30
-  assessment: { type:Number, default:0 }, // 0-20
-  exam: { type:Number, default:0 },       // 0-50
-  total: { type:Number, default:0 },      // 0-100
+  internal: { type:Number, default:0 },
+  assessment: { type:Number, default:0 },
+  exam: { type:Number, default:0 },
+  total: { type:Number, default:0 },
   gradePoint: { type:Number, default:0 }
 }, { timestamps:true });
 
 const ClassSchema = new mongoose.Schema({ name:String }, { timestamps:true });
 const SubjectSchema = new mongoose.Schema({ name:String }, { timestamps:true });
 
-/* ✅ Force collections */
 const User = mongoose.model("User", UserSchema, "users");
 const Attendance = mongoose.model("Attendance", AttendanceSchema, "attendance");
 const Marks = mongoose.model("Marks", MarksSchema, "marks");
@@ -135,15 +137,12 @@ function safeUser(u){
     role: u.role,
     rollNumber: u.rollNumber,
     enrolledClass: u.enrolledClass,
-
     monitorClasses: u.monitorClasses || [],
-
     gender: u.gender || "",
     phone: u.phone || "",
     dob: u.dob || "",
     address: u.address || "",
-    profilePic: u.profilePic || "",
-    emailVerified: u.emailVerified || false
+    profilePic: u.profilePic || ""
   };
 }
 
@@ -158,6 +157,7 @@ function createToken(u){
 function auth(req, res, next){
   const header = req.headers.authorization;
   if(!header) return res.status(401).json({ success:false, message:"Missing token" });
+
   const token = header.split(" ")[1];
   if(!token) return res.status(401).json({ success:false, message:"Invalid token" });
 
@@ -171,13 +171,6 @@ function auth(req, res, next){
 
 function isValidEmail(email){
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
-}
-
-function generateOTP(){
-  return String(Math.floor(100000 + Math.random() * 900000));
-}
-function hashOTP(otp){
-  return crypto.createHash("sha256").update(otp).digest("hex");
 }
 
 function calcGradePoint(total){
@@ -194,16 +187,17 @@ function calcGradePoint(total){
 ================================ */
 app.get("/", (req, res) => res.send("✅ ATTENDIFY Backend Running"));
 
-/* ✅ Signup (OTP sent) */
+/* ✅ Signup (No OTP, any email allowed) */
 app.post("/signup", async (req,res)=>{
   try{
     const { name, email, rollNumber, password } = req.body;
 
     if(!name || !email || !rollNumber || !password){
-      return res.json({ success:false, message:"Fill all fields" });
+      return res.status(400).json({ success:false, message:"Fill all fields" });
     }
 
     const cleanEmail = email.trim().toLowerCase();
+
     if(!isValidEmail(cleanEmail)){
       return res.json({ success:false, message:"Invalid email format" });
     }
@@ -219,116 +213,29 @@ app.post("/signup", async (req,res)=>{
 
     const passwordHash = await bcrypt.hash(password, 10);
 
-    const otp = generateOTP();
-    const otpHash = hashOTP(otp);
-    const otpExpiry = new Date(Date.now() + 10*60*1000).toISOString();
-
-    await User.create({
+    const user = await User.create({
       name,
       email: cleanEmail,
       rollNumber,
       passwordHash,
       role,
-      enrolledClass: null,
-      monitorClasses: [],
-      emailVerified:false,
-      otpHash,
-      otpExpiry
+      enrolledClass: null
     });
 
-    await sendMail(
-      cleanEmail,
-      "ATTENDIFY Email Verification OTP",
-      `Hello ${name},
-
-Your OTP is: ${otp}
-Expires in 10 minutes.
-
-- ATTENDIFY`
-    );
-
-    res.json({ success:true, message:"OTP sent to email ✅", rollNumber });
-
-  }catch(err){
-    res.status(500).json({ success:false, message:err.message });
-  }
-});
-
-/* ✅ Verify OTP */
-app.post("/verify-email", async (req,res)=>{
-  try{
-    const { rollNumber, otp } = req.body;
-    if(!rollNumber || !otp) return res.json({ success:false, message:"Roll + OTP required" });
-
-    const user = await User.findOne({ rollNumber });
-    if(!user) return res.json({ success:false, message:"User not found" });
-
-    if(user.emailVerified){
-      const token = createToken(user);
-      return res.json({ success:true, token, user:safeUser(user) });
-    }
-
-    if(new Date() > new Date(user.otpExpiry)){
-      return res.json({ success:false, message:"OTP expired. Resend OTP." });
-    }
-
-    if(hashOTP(String(otp).trim()) !== user.otpHash){
-      return res.json({ success:false, message:"Invalid OTP" });
-    }
-
-    user.emailVerified = true;
-    user.otpHash = "";
-    user.otpExpiry = "";
-    await user.save();
-
     const token = createToken(user);
-    res.json({ success:true, message:"Verified ✅", token, user:safeUser(user) });
+    res.json({ success:true, token, user: safeUser(user) });
 
   }catch(err){
     res.status(500).json({ success:false, message:err.message });
   }
 });
 
-/* ✅ Resend OTP */
-app.post("/resend-otp", async (req,res)=>{
-  try{
-    const { rollNumber } = req.body;
-    if(!rollNumber) return res.json({ success:false, message:"Roll required" });
-
-    const user = await User.findOne({ rollNumber });
-    if(!user) return res.json({ success:false, message:"User not found" });
-
-    if(user.emailVerified) return res.json({ success:true, message:"Already verified ✅" });
-
-    const otp = generateOTP();
-    user.otpHash = hashOTP(otp);
-    user.otpExpiry = new Date(Date.now() + 10*60*1000).toISOString();
-    await user.save();
-
-    await sendMail(
-      user.email,
-      "ATTENDIFY OTP Resend",
-      `Hello ${user.name},
-
-Your new OTP is: ${otp}
-Expires in 10 minutes.
-
-- ATTENDIFY`
-    );
-
-    res.json({ success:true, message:"OTP resent ✅" });
-
-  }catch(err){
-    res.status(500).json({ success:false, message:err.message });
-  }
-});
-
-/* ✅ Login */
+/* ✅ Login (works for all existing users) */
 app.post("/login", async (req,res)=>{
   try{
     const { loginId, password } = req.body;
     if(!loginId || !password){
-      return res.json({ success:false, message:"Fill all fields" });
+      return res.status(400).json({ success:false, message:"Fill all fields" });
     }
 
     const user = await User.findOne({
@@ -341,20 +248,11 @@ app.post("/login", async (req,res)=>{
 
     if(!user) return res.json({ success:false, message:"Invalid credentials" });
 
-    if(!user.emailVerified){
-      return res.json({
-        success:false,
-        message:"Email not verified. Enter OTP.",
-        needsVerification:true,
-        rollNumber:user.rollNumber
-      });
-    }
-
     const ok = await bcrypt.compare(password, user.passwordHash);
     if(!ok) return res.json({ success:false, message:"Invalid credentials" });
 
     const token = createToken(user);
-    res.json({ success:true, token, user:safeUser(user) });
+    res.json({ success:true, token, user: safeUser(user) });
 
   }catch(err){
     res.status(500).json({ success:false, message:err.message });
@@ -364,8 +262,8 @@ app.post("/login", async (req,res)=>{
 /* ✅ Me */
 app.get("/me", auth, async (req,res)=>{
   const user = await User.findOne({ rollNumber:req.user.rollNumber });
-  if(!user) return res.json({ success:false, message:"User not found" });
-  res.json({ success:true, user:safeUser(user) });
+  if(!user) return res.status(404).json({ success:false, message:"User not found" });
+  res.json({ success:true, user: safeUser(user) });
 });
 
 /* ✅ Enroll */
@@ -378,7 +276,6 @@ app.post("/enroll", auth, async (req,res)=>{
 
   user.enrolledClass = className;
   await user.save();
-
   res.json({ success:true, user:safeUser(user) });
 });
 
@@ -392,10 +289,11 @@ app.post("/profile", auth, async (req,res)=>{
 
     if(name) user.name = name;
     if(rollNumber) user.rollNumber = rollNumber;
-    user.gender = gender ?? user.gender;
-    user.phone = phone ?? user.phone;
-    user.dob = dob ?? user.dob;
-    user.address = address ?? user.address;
+
+    if(gender !== undefined) user.gender = gender;
+    if(phone !== undefined) user.phone = phone;
+    if(dob !== undefined) user.dob = dob;
+    if(address !== undefined) user.address = address;
     if(profilePic) user.profilePic = profilePic;
 
     if(password && password.trim()){
@@ -422,13 +320,13 @@ app.get("/subjects", auth, async (req,res)=>{
   res.json({ success:true, subjects });
 });
 
-/* ✅ Student Attendance */
+/* ✅ Attendance (student view) */
 app.get("/attendance", auth, async (req,res)=>{
   const records = await Attendance.find({ rollNumber:req.user.rollNumber }).sort({ date:-1 });
   res.json({ success:true, records });
 });
 
-/* ✅ Student Results (all segments) */
+/* ✅ Results (student view) */
 app.get("/results", auth, async (req,res)=>{
   const records = await Marks.find({ rollNumber:req.user.rollNumber }).sort({ updatedAt:-1 });
   res.json({ success:true, records });
@@ -437,15 +335,14 @@ app.get("/results", auth, async (req,res)=>{
 /* ✅ CGPA */
 app.get("/cgpa", auth, async (req,res)=>{
   const records = await Marks.find({ rollNumber:req.user.rollNumber });
-
   if(records.length === 0) return res.json({ success:true, cgpa:0 });
 
-  const sum = records.reduce((a,b)=>a+(b.gradePoint || 0),0);
+  const sum = records.reduce((a,b)=>a+(b.gradePoint||0),0);
   const cgpa = Number((sum / records.length).toFixed(2));
   res.json({ success:true, cgpa });
 });
 
-/* ✅ PDF Marksheet */
+/* ✅ Marksheet PDF */
 app.get("/marksheet/pdf", auth, async (req,res)=>{
   const user = await User.findOne({ rollNumber:req.user.rollNumber });
   const marks = await Marks.find({ rollNumber:req.user.rollNumber });
@@ -460,7 +357,7 @@ app.get("/marksheet/pdf", auth, async (req,res)=>{
   doc.moveDown();
 
   doc.fontSize(12).text(`Name: ${user.name}`);
-  doc.text(`Roll Number: ${user.rollNumber}`);
+  doc.text(`Roll: ${user.rollNumber}`);
   doc.text(`Class: ${user.enrolledClass || "-"}`);
   doc.text(`Email: ${user.email}`);
   doc.moveDown();
@@ -475,18 +372,17 @@ app.get("/marksheet/pdf", auth, async (req,res)=>{
   });
 
   doc.moveDown();
-  const sumGP = marks.reduce((a,b)=>a+(b.gradePoint||0),0);
-  const cgpa = marks.length ? (sumGP / marks.length).toFixed(2) : "0.00";
-
+  const cgpa = marks.length
+    ? (marks.reduce((a,b)=>a+(b.gradePoint||0),0) / marks.length).toFixed(2)
+    : "0.00";
   doc.fontSize(14).text(`CGPA: ${cgpa}`, { align:"right" });
+
   doc.end();
 });
 
 /* ===============================
-   OWNER / STAFF ROUTES
+   OWNER/STAFF ROUTES
 ================================ */
-
-/* ✅ Owner/Staff: users list */
 app.get("/owner/users", auth, async (req,res)=>{
   const me = await User.findOne({ rollNumber:req.user.rollNumber });
   if(!me) return res.json({ success:false, message:"User not found" });
@@ -499,12 +395,11 @@ app.get("/owner/users", auth, async (req,res)=>{
   res.json({ success:true, users: users.map(safeUser) });
 });
 
-/* ✅ Owner: add user directly */
 app.post("/owner/add-user", auth, async (req,res)=>{
   try{
     const me = await User.findOne({ rollNumber:req.user.rollNumber });
     if(!me || me.role !== "owner"){
-      return res.status(403).json({ success:false, message:"Only owner can add users" });
+      return res.status(403).json({ success:false, message:"Only owner" });
     }
 
     const { name, email, rollNumber, password } = req.body;
@@ -525,49 +420,28 @@ app.post("/owner/add-user", auth, async (req,res)=>{
 
     const passwordHash = await bcrypt.hash(password, 10);
 
-    const otp = generateOTP();
-    const otpHash = hashOTP(otp);
-    const otpExpiry = new Date(Date.now() + 10*60*1000).toISOString();
-
     await User.create({
       name,
       email: cleanEmail,
       rollNumber,
       passwordHash,
       role:"student",
-      enrolledClass:null,
-      emailVerified:false,
-      otpHash,
-      otpExpiry
+      enrolledClass:null
     });
 
-    await sendMail(
-      cleanEmail,
-      "ATTENDIFY Account Created + OTP",
-      `Hello ${name},
-
-Your ATTENDIFY account was created by Admin.
-
-OTP: ${otp}
-Expires in 10 minutes.
-
-- ATTENDIFY`
-    );
-
-    res.json({ success:true, message:"Student added + OTP sent ✅" });
+    res.json({ success:true, message:"Student added ✅" });
 
   }catch(err){
     res.status(500).json({ success:false, message:err.message });
   }
 });
 
-/* ✅ Owner: add class */
 app.post("/owner/class", auth, async (req,res)=>{
   const me = await User.findOne({ rollNumber:req.user.rollNumber });
   if(!me || me.role !== "owner") return res.status(403).json({ success:false, message:"Only owner" });
 
   const { name } = req.body;
-  if(!name) return res.json({ success:false, message:"Class name required" });
+  if(!name) return res.json({ success:false, message:"Class required" });
 
   const exists = await ClassModel.findOne({ name });
   if(exists) return res.json({ success:false, message:"Class exists" });
@@ -576,13 +450,12 @@ app.post("/owner/class", auth, async (req,res)=>{
   res.json({ success:true, message:"Class added ✅" });
 });
 
-/* ✅ Owner: add subject */
 app.post("/owner/subject", auth, async (req,res)=>{
   const me = await User.findOne({ rollNumber:req.user.rollNumber });
   if(!me || me.role !== "owner") return res.status(403).json({ success:false, message:"Only owner" });
 
   const { name } = req.body;
-  if(!name) return res.json({ success:false, message:"Subject name required" });
+  if(!name) return res.json({ success:false, message:"Subject required" });
 
   const exists = await SubjectModel.findOne({ name });
   if(exists) return res.json({ success:false, message:"Subject exists" });
@@ -591,34 +464,30 @@ app.post("/owner/subject", auth, async (req,res)=>{
   res.json({ success:true, message:"Subject added ✅" });
 });
 
-/* ✅ Owner: assign role + monitor classes */
+/* ✅ Owner assign staff role + monitor classes */
 app.post("/owner/user/:rollNumber/role", auth, async (req,res)=>{
-  try{
-    const me = await User.findOne({ rollNumber:req.user.rollNumber });
-    if(!me || me.role !== "owner") return res.status(403).json({ success:false, message:"Only owner" });
-
-    const { role, monitorClasses } = req.body;
-
-    const user = await User.findOne({ rollNumber:req.params.rollNumber });
-    if(!user) return res.json({ success:false, message:"User not found" });
-
-    user.role = role;
-
-    if(role === "staff"){
-      user.monitorClasses = Array.isArray(monitorClasses) ? monitorClasses : [];
-    }else{
-      user.monitorClasses = [];
-    }
-
-    await user.save();
-    res.json({ success:true, user:safeUser(user) });
-
-  }catch(err){
-    res.status(500).json({ success:false, message:err.message });
+  const me = await User.findOne({ rollNumber:req.user.rollNumber });
+  if(!me || me.role !== "owner"){
+    return res.status(403).json({ success:false, message:"Only owner" });
   }
+
+  const { role, monitorClasses } = req.body;
+  const user = await User.findOne({ rollNumber:req.params.rollNumber });
+  if(!user) return res.json({ success:false, message:"User not found" });
+
+  user.role = role;
+
+  if(role === "staff"){
+    user.monitorClasses = Array.isArray(monitorClasses) ? monitorClasses : [];
+  }else{
+    user.monitorClasses = [];
+  }
+
+  await user.save();
+  res.json({ success:true, user:safeUser(user) });
 });
 
-/* ✅ Owner/Staff: attendance by date */
+/* ✅ Attendance by date for admin */
 app.post("/owner/attendance/by-date", auth, async (req,res)=>{
   const { className, date } = req.body;
 
@@ -629,90 +498,88 @@ app.post("/owner/attendance/by-date", auth, async (req,res)=>{
     return res.status(403).json({ success:false, message:"Not allowed" });
   }
 
-  // staff permission check
   if(me.role === "staff" && !me.monitorClasses.includes(className)){
-    return res.status(403).json({ success:false, message:"Staff not allowed for this class" });
+    return res.status(403).json({ success:false, message:"Not allowed for this class" });
   }
 
   const records = await Attendance.find({ className, date });
   res.json({ success:true, records });
 });
 
-/* ✅ Owner/Staff: save attendance */
+/* ✅ Save attendance */
 app.post("/owner/attendance", auth, async (req,res)=>{
-  try{
-    const { rollNumber, className, status, date } = req.body;
+  const { rollNumber, className, status, date } = req.body;
 
-    const me = await User.findOne({ rollNumber:req.user.rollNumber });
-    if(!me) return res.json({ success:false, message:"User not found" });
+  const me = await User.findOne({ rollNumber:req.user.rollNumber });
+  if(!me) return res.json({ success:false, message:"User not found" });
 
-    if(me.role !== "owner" && me.role !== "staff"){
-      return res.status(403).json({ success:false, message:"Not allowed" });
-    }
-
-    if(me.role === "staff" && !me.monitorClasses.includes(className)){
-      return res.status(403).json({ success:false, message:"Staff not allowed for this class" });
-    }
-
-    await Attendance.findOneAndUpdate(
-      { rollNumber, className, date },
-      { rollNumber, className, date, status },
-      { upsert:true, new:true }
-    );
-
-    res.json({ success:true, message:"Attendance saved ✅" });
-
-  }catch(err){
-    res.status(500).json({ success:false, message:err.message });
+  if(me.role !== "owner" && me.role !== "staff"){
+    return res.status(403).json({ success:false, message:"Not allowed" });
   }
+
+  if(me.role === "staff" && !me.monitorClasses.includes(className)){
+    return res.status(403).json({ success:false, message:"Not allowed for this class" });
+  }
+
+  await Attendance.findOneAndUpdate(
+    { rollNumber, className, date },
+    { rollNumber, className, date, status },
+    { upsert:true }
+  );
+
+  res.json({ success:true, message:"Attendance saved ✅" });
 });
 
-/* ✅ Owner/Staff: save marks + notify */
+/* ✅ Save marks + email/whatsapp notify (optional) */
 app.post("/owner/marks", auth, async (req,res)=>{
-  try{
-    const { rollNumber, className, subject, internal, assessment, exam } = req.body;
+  const { rollNumber, className, subject, internal, assessment, exam } = req.body;
 
-    const me = await User.findOne({ rollNumber:req.user.rollNumber });
-    if(!me) return res.json({ success:false, message:"User not found" });
+  const me = await User.findOne({ rollNumber:req.user.rollNumber });
+  if(!me) return res.json({ success:false, message:"User not found" });
 
-    if(me.role !== "owner" && me.role !== "staff"){
-      return res.status(403).json({ success:false, message:"Not allowed" });
-    }
+  if(me.role !== "owner" && me.role !== "staff"){
+    return res.status(403).json({ success:false, message:"Not allowed" });
+  }
 
-    if(me.role === "staff" && !me.monitorClasses.includes(className)){
-      return res.status(403).json({ success:false, message:"Staff not allowed for this class" });
-    }
+  if(me.role === "staff" && !me.monitorClasses.includes(className)){
+    return res.status(403).json({ success:false, message:"Not allowed for this class" });
+  }
 
-    const total = Number(internal || 0) + Number(assessment || 0) + Number(exam || 0);
-    const gradePoint = calcGradePoint(total);
+  const total = Number(internal || 0) + Number(assessment || 0) + Number(exam || 0);
+  const gradePoint = calcGradePoint(total);
 
-    const updated = await Marks.findOneAndUpdate(
-      { rollNumber, subject, className },
-      { rollNumber, className, subject, internal, assessment, exam, total, gradePoint },
-      { upsert:true, new:true }
+  const updated = await Marks.findOneAndUpdate(
+    { rollNumber, className, subject },
+    { rollNumber, className, subject, internal, assessment, exam, total, gradePoint },
+    { upsert:true, new:true }
+  );
+
+  // Notify student (optional)
+  const student = await User.findOne({ rollNumber });
+  if(student){
+    await sendMail(
+      student.email,
+      `ATTENDIFY Results Updated - ${subject}`,
+      `Hello ${student.name},
+
+Your marks updated ✅
+
+Subject: ${subject}
+Internal: ${internal}/30
+Assessment: ${assessment}/20
+Exam: ${exam}/50
+Total: ${total}/100
+
+- ATTENDIFY`
     );
 
-    const student = await User.findOne({ rollNumber });
-
-    if(student && student.emailVerified){
-      await sendMail(
-        student.email,
-        `ATTENDIFY Results Updated - ${subject}`,
-        `Hello ${student.name},
-
-      );
-
-      await sendWhatsApp(
-        student.phone,
-        `ATTENDIFY ✅ Results Updated\n${subject}\nTotal: ${total}/100`
-      );
-    }
-
-    res.json({ success:true, updated });
-
-  }catch(err){
-    res.status(500).json({ success:false, message:err.message });
+    await sendWhatsApp(
+      student.phone,
+      `ATTENDIFY ✅ Results Updated\n${subject}\nTotal: ${total}/100`
+    );
   }
+
+  res.json({ success:true, updated });
 });
 
 /* ✅ Start */
