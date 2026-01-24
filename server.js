@@ -6,9 +6,6 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import multer from "multer";
 
-import * as faceapi from "@vladmandic/face-api";
-import canvas from "canvas";
-
 dotenv.config();
 const app = express();
 
@@ -18,12 +15,13 @@ app.use(cors({
   methods: ["GET","POST","PUT","DELETE"],
   allowedHeaders: ["Content-Type","Authorization"]
 }));
+
 app.use(express.json({ limit: "12mb" }));
 
 const JWT_SECRET = process.env.JWT_SECRET || "CHANGE_THIS_SECRET";
 const MONGO_URI = process.env.MONGO_URI;
 
-/* ✅ Mongo Connect */
+/* ✅ Connect MongoDB */
 mongoose.connect(MONGO_URI, { serverSelectionTimeoutMS: 15000 })
   .then(() => console.log("✅ MongoDB Connected to DB:", mongoose.connection.name))
   .catch(err => console.log("❌ MongoDB Error:", err.message));
@@ -36,7 +34,7 @@ const UserSchema = new mongoose.Schema({
   email: String,
   rollNumber: String,
   passwordHash: String,
-  role: String,
+  role: String,               // owner / staff / student
   enrolledClass: String,
 
   gender: String,
@@ -45,8 +43,9 @@ const UserSchema = new mongoose.Schema({
   address: String,
   profilePic: String,
 
-  // ✅ face data
-  faceDescriptors: { type: [Array], default: [] }
+  // ✅ FACE DATA (store image in base64)
+  faceImage: String,          // base64 string "data:image/jpeg;base64,..."
+  faceUpdatedAt: String
 }, { timestamps: true });
 
 const AttendanceSchema = new mongoose.Schema({
@@ -54,15 +53,22 @@ const AttendanceSchema = new mongoose.Schema({
   className: String,
   date: String,
   status: String,
-  markedBy: String
+  markedBy: String            // "owner" / "staff" / "esp32"
 }, { timestamps: true });
 
-const ClassSchema = new mongoose.Schema({ name: String }, { timestamps: true });
+const ClassSchema = new mongoose.Schema({
+  name: String
+}, { timestamps: true });
 
-/* ✅ Models */
+const SubjectSchema = new mongoose.Schema({
+  name: String
+}, { timestamps: true });
+
+/* ✅ COLLECTION NAMES */
 const User = mongoose.model("User", UserSchema, "users");
 const Attendance = mongoose.model("Attendance", AttendanceSchema, "attendance");
 const ClassModel = mongoose.model("Class", ClassSchema, "classes");
+const SubjectModel = mongoose.model("Subject", SubjectSchema, "subjects");
 
 /* ===============================
    HELPERS
@@ -78,7 +84,8 @@ function safeUser(u){
     phone: u.phone || "",
     dob: u.dob || "",
     address: u.address || "",
-    profilePic: u.profilePic || ""
+    profilePic: u.profilePic || "",
+    faceRegistered: !!u.faceImage
   };
 }
 
@@ -105,60 +112,37 @@ function auth(req, res, next){
   }
 }
 
+function ownerOrStaff(req, res, next){
+  if(req.user.role === "owner" || req.user.role === "staff") return next();
+  return res.status(403).json({ success:false, message:"Not allowed" });
+}
+
 /* ===============================
-   FACE API SETUP
+   FILE UPLOAD (multer)
 ================================ */
-const { Canvas, Image, ImageData } = canvas;
-faceapi.env.monkeyPatch({ Canvas, Image, ImageData });
-
-async function loadModels(){
-  try{
-    await faceapi.nets.ssdMobilenetv1.loadFromDisk("./models");
-    await faceapi.nets.faceLandmark68Net.loadFromDisk("./models");
-    await faceapi.nets.faceRecognitionNet.loadFromDisk("./models");
-    console.log("✅ Face models loaded");
-  }catch(err){
-    console.log("❌ Face model load error:", err.message);
-  }
-}
-loadModels();
-
-/* Multer image upload */
-const upload = multer({ storage: multer.memoryStorage() });
-
-function euclideanDistance(a, b){
-  let sum = 0;
-  for(let i=0;i<a.length;i++){
-    sum += (a[i] - b[i]) ** 2;
-  }
-  return Math.sqrt(sum);
-}
-
-async function getFaceDescriptorFromBuffer(buffer){
-  const img = await canvas.loadImage(buffer);
-  const detection = await faceapi
-    .detectSingleFace(img)
-    .withFaceLandmarks()
-    .withFaceDescriptor();
-
-  if(!detection) return null;
-  return Array.from(detection.descriptor);
-}
+const storage = multer.memoryStorage();
+const upload = multer({
+  storage,
+  limits: { fileSize: 5 * 1024 * 1024 } // ✅ max 5MB
+});
 
 /* ===============================
    ROUTES
 ================================ */
-app.get("/", (req,res) => res.send("✅ ATTENDIFY Backend Running"));
+app.get("/", (req, res) => {
+  res.json({ success:true, message:"✅ ATTENDIFY Backend Running" });
+});
 
-/* Signup */
-app.post("/signup", async (req,res) => {
+/* ✅ Signup */
+app.post("/signup", async (req, res) => {
   try{
     const { name, email, rollNumber, password } = req.body;
-    if(!name || !email || !rollNumber || !password)
+    if(!name || !email || !rollNumber || !password){
       return res.status(400).json({ success:false, message:"Fill all fields" });
+    }
 
-    const exists = await User.findOne({ email: email.toLowerCase() });
-    if(exists) return res.json({ success:false, message:"Email already exists" });
+    const emailExists = await User.findOne({ email: email.toLowerCase() });
+    if(emailExists) return res.json({ success:false, message:"Email already exists" });
 
     const rollExists = await User.findOne({ rollNumber });
     if(rollExists) return res.json({ success:false, message:"Roll number already exists" });
@@ -179,14 +163,13 @@ app.post("/signup", async (req,res) => {
 
     const token = createToken(user);
     res.json({ success:true, token, user: safeUser(user) });
-
   }catch(err){
     res.status(500).json({ success:false, message: err.message });
   }
 });
 
-/* Login */
-app.post("/login", async (req,res) => {
+/* ✅ Login */
+app.post("/login", async (req, res) => {
   try{
     const { loginId, password } = req.body;
     if(!loginId || !password) return res.status(400).json({ success:false, message:"Fill all fields" });
@@ -206,121 +189,211 @@ app.post("/login", async (req,res) => {
 
     const token = createToken(user);
     res.json({ success:true, token, user: safeUser(user) });
-
   }catch(err){
     res.status(500).json({ success:false, message: err.message });
   }
 });
 
-/* Me */
-app.get("/me", auth, async (req,res) => {
+/* ✅ Me */
+app.get("/me", auth, async (req, res) => {
   const user = await User.findOne({ rollNumber: req.user.rollNumber });
-  if(!user) return res.json({ success:false, message:"User not found" });
+  if(!user) return res.status(404).json({ success:false, message:"User not found" });
   res.json({ success:true, user: safeUser(user) });
 });
 
-/* Enroll */
-app.post("/enroll", auth, async (req,res) => {
+/* ✅ Enroll */
+app.post("/enroll", auth, async (req, res) => {
   try{
     const { className } = req.body;
-    if(!className) return res.json({ success:false, message:"Class required" });
+    if(!className) return res.json({ success:false, message:"Missing className" });
 
-    const user = await User.findOne({ rollNumber: req.user.rollNumber });
-    if(!user) return res.json({ success:false, message:"User not found" });
+    const user = await User.findOneAndUpdate(
+      { rollNumber: req.user.rollNumber },
+      { enrolledClass: className },
+      { new: true }
+    );
 
-    user.enrolledClass = className;
-    await user.save();
-
-    res.json({ success:true, message:"Enrolled ✅", user: safeUser(user) });
-
+    res.json({ success:true, user: safeUser(user) });
   }catch(err){
     res.status(500).json({ success:false, message: err.message });
   }
 });
 
-/* Classes */
-app.get("/classes", auth, async (req,res) => {
+/* ✅ Get Classes */
+app.get("/classes", auth, async (req, res) => {
   const classes = await ClassModel.find().sort({ name: 1 });
   res.json({ success:true, classes });
 });
 
-/* Attendance */
-app.get("/attendance", auth, async (req,res) => {
+/* ✅ Get Subjects */
+app.get("/subjects", auth, async (req, res) => {
+  const subjects = await SubjectModel.find().sort({ name: 1 });
+  res.json({ success:true, subjects });
+});
+
+/* ✅ Student Attendance */
+app.get("/attendance", auth, async (req, res) => {
   const records = await Attendance.find({ rollNumber: req.user.rollNumber }).sort({ date: -1 });
   res.json({ success:true, records });
 });
 
-/* ====================================================
-   ✅ FACE ENROLL (APP)
-==================================================== */
-app.post("/face/enroll", auth, upload.single("image"), async (req,res) => {
+/* ✅ Profile Update (works with your frontend) */
+app.post("/profile", auth, async (req, res) => {
   try{
-    if(!req.file) return res.json({ success:false, message:"No image uploaded" });
+    const update = req.body || {};
+    delete update.role;
+    delete update.passwordHash;
 
-    const descriptor = await getFaceDescriptorFromBuffer(req.file.buffer);
-    if(!descriptor) return res.json({ success:false, message:"No face detected. Try again." });
+    // password update
+    if(update.password && update.password.trim()){
+      update.passwordHash = await bcrypt.hash(update.password.trim(), 10);
+    }
+    delete update.password;
 
-    const user = await User.findOne({ rollNumber: req.user.rollNumber });
-    if(!user) return res.json({ success:false, message:"User not found" });
+    const user = await User.findOneAndUpdate(
+      { rollNumber: req.user.rollNumber },
+      { $set: update },
+      { new: true }
+    );
 
-    user.faceDescriptors.push(descriptor);
-    await user.save();
+    res.json({ success:true, user: safeUser(user) });
+  }catch(err){
+    res.status(500).json({ success:false, message: err.message });
+  }
+});
 
-    res.json({ success:true, message:"Face enrolled ✅", faceCount: user.faceDescriptors.length });
+/* =======================================================
+   ✅ FACE REGISTER (CAMERA FROM APP)
+   POST /face/enroll
+   form-data: image=<file>
+======================================================= */
+app.post("/face/enroll", auth, upload.single("image"), async (req, res) => {
+  try{
+    if(!req.file){
+      return res.status(400).json({ success:false, message:"No image uploaded" });
+    }
+
+    const base64 = `data:${req.file.mimetype};base64,${req.file.buffer.toString("base64")}`;
+
+    const now = new Date().toISOString();
+
+    const user = await User.findOneAndUpdate(
+      { rollNumber: req.user.rollNumber },
+      { faceImage: base64, faceUpdatedAt: now },
+      { new: true }
+    );
+
+    if(!user) return res.status(404).json({ success:false, message:"User not found" });
+
+    return res.json({
+      success: true,
+      message: "Face registered successfully",
+      user: safeUser(user)
+    });
 
   }catch(err){
     res.status(500).json({ success:false, message: err.message });
   }
 });
 
-/* ====================================================
-   ✅ ESP32 MARK ATTENDANCE
-==================================================== */
-app.post("/face/mark-attendance", upload.single("image"), async (req,res) => {
+/* =======================================================
+   ✅ ESP32 VERIFY FACE
+   POST /face/verify
+   form-data: image=<file>, className=<text>
+======================================================= */
+app.post("/face/verify", upload.single("image"), async (req, res) => {
   try{
     const { className } = req.body;
-    if(!className) return res.json({ success:false, message:"className required" });
-    if(!req.file) return res.json({ success:false, message:"No image uploaded" });
 
-    const descriptor = await getFaceDescriptorFromBuffer(req.file.buffer);
-    if(!descriptor) return res.json({ success:false, message:"No face detected" });
+    if(!className) return res.status(400).json({ success:false, message:"Missing className" });
+    if(!req.file) return res.status(400).json({ success:false, message:"Missing image file" });
 
-    const users = await User.find({ enrolledClass: className });
+    // ✅ Placeholder matching:
+    // In real system: you extract face embedding and compare.
+    // For now: respond success but tell to map recognition later.
+    // We'll just return a dummy "not implemented".
+    return res.json({
+      success: false,
+      message: "Face recognition matching not implemented yet. Face stored ✅ but matching requires ML model."
+    });
 
-    let bestMatch = null;
-    let bestDist = 999;
+  }catch(err){
+    res.status(500).json({ success:false, message: err.message });
+  }
+});
 
-    for(const u of users){
-      for(const d of (u.faceDescriptors || [])){
-        const dist = euclideanDistance(descriptor, d);
-        if(dist < bestDist){
-          bestDist = dist;
-          bestMatch = u;
-        }
-      }
-    }
-
-    if(!bestMatch || bestDist > 0.55){
-      return res.json({ success:false, message:"Face not recognized", distance: bestDist });
+/* =======================================================
+   ✅ ESP32 MARK ATTENDANCE (TODAY)
+   POST /face/mark-attendance
+   body: { rollNumber, className }
+======================================================= */
+app.post("/face/mark-attendance", async (req, res) => {
+  try{
+    const { rollNumber, className } = req.body;
+    if(!rollNumber || !className){
+      return res.status(400).json({ success:false, message:"rollNumber and className required" });
     }
 
     const today = new Date().toISOString().split("T")[0];
 
-    const record = await Attendance.findOneAndUpdate(
-      { rollNumber: bestMatch.rollNumber, className, date: today },
+    // ✅ Upsert (update if exists)
+    const saved = await Attendance.findOneAndUpdate(
+      { rollNumber, className, date: today },
       { status: "Present", markedBy: "esp32" },
       { upsert: true, new: true }
     );
 
-    res.json({
-      success:true,
-      message:`Attendance marked ✅ for ${bestMatch.name}`,
-      rollNumber: bestMatch.rollNumber,
-      name: bestMatch.name,
-      distance: bestDist,
-      record
+    return res.json({
+      success: true,
+      message: `Attendance marked Present for ${today}`,
+      record: saved
     });
 
+  }catch(err){
+    res.status(500).json({ success:false, message: err.message });
+  }
+});
+
+/* ===============================
+   OWNER/STAFF Attendance Mark
+================================ */
+app.post("/owner/attendance", auth, ownerOrStaff, async (req, res) => {
+  try{
+    const { rollNumber, className, status, date } = req.body;
+    if(!rollNumber || !className || !status || !date){
+      return res.status(400).json({ success:false, message:"Missing fields" });
+    }
+
+    const saved = await Attendance.findOneAndUpdate(
+      { rollNumber, className, date },
+      { status, markedBy: req.user.role },
+      { upsert: true, new: true }
+    );
+
+    res.json({ success:true, message:"Attendance updated", record: saved });
+  }catch(err){
+    res.status(500).json({ success:false, message: err.message });
+  }
+});
+
+/* ✅ Attendance by date (for admin buttons) */
+app.post("/owner/attendance/by-date", auth, ownerOrStaff, async (req, res) => {
+  try{
+    const { className, date } = req.body;
+    if(!className || !date) return res.json({ success:false, message:"Missing className/date" });
+
+    const records = await Attendance.find({ className, date });
+    res.json({ success:true, records });
+  }catch(err){
+    res.status(500).json({ success:false, message: err.message });
+  }
+});
+
+/* ✅ Owner Users */
+app.get("/owner/users", auth, ownerOrStaff, async (req, res) => {
+  try{
+    const users = await User.find().sort({ createdAt: -1 });
+    res.json({ success:true, users: users.map(safeUser) });
   }catch(err){
     res.status(500).json({ success:false, message: err.message });
   }
