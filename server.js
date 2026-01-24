@@ -9,7 +9,6 @@ import multer from "multer";
 dotenv.config();
 const app = express();
 
-/* ✅ CORS */
 app.use(cors({
   origin: "*",
   methods: ["GET","POST","PUT","DELETE"],
@@ -21,29 +20,22 @@ app.use(express.json({ limit: "12mb" }));
 const JWT_SECRET = process.env.JWT_SECRET || "CHANGE_THIS_SECRET";
 const MONGO_URI = process.env.MONGO_URI;
 
-/* ✅ Connect MongoDB */
 mongoose.connect(MONGO_URI, { serverSelectionTimeoutMS: 15000 })
   .then(() => console.log("✅ MongoDB Connected:", mongoose.connection.name))
   .catch(err => console.log("❌ MongoDB Error:", err.message));
 
-/* ===============================
-   SCHEMAS
-================================ */
 const UserSchema = new mongoose.Schema({
   name: String,
   email: String,
   rollNumber: String,
   passwordHash: String,
-  role: { type:String, default:"student" }, // owner/staff/student
+  role: { type:String, default:"student" },
   enrolledClass: { type:String, default:null },
-
   gender: String,
   phone: String,
   dob: String,
   address: String,
   profilePic: String,
-
-  // ✅ face data
   faceImage: String,
   faceUpdatedAt: String
 }, { timestamps:true });
@@ -69,9 +61,6 @@ const Attendance = mongoose.model("Attendance", AttendanceSchema, "attendance");
 const ClassModel = mongoose.model("Class", ClassSchema, "classes");
 const SubjectModel = mongoose.model("Subject", SubjectSchema, "subjects");
 
-/* ===============================
-   HELPERS
-================================ */
 function safeUser(u){
   return {
     name: u.name,
@@ -116,23 +105,16 @@ function ownerOrStaff(req, res, next){
   return res.status(403).json({ success:false, message:"Not allowed" });
 }
 
-/* ===============================
-   MULTER
-================================ */
 const storage = multer.memoryStorage();
 const upload = multer({
   storage,
   limits: { fileSize: 5 * 1024 * 1024 }
 });
 
-/* ===============================
-   ROUTES
-================================ */
 app.get("/", (req, res) => {
-  res.json({ success:true, message:"✅ ATTENDIFY Backend Running" });
+  res.json({ success:true, message:"ATTENDIFY Backend Running" });
 });
 
-/* ✅ Signup */
 app.post("/signup", async (req, res) => {
   try{
     const { name, email, rollNumber, password } = req.body;
@@ -168,7 +150,6 @@ app.post("/signup", async (req, res) => {
   }
 });
 
-/* ✅ Login */
 app.post("/login", async (req, res) => {
   try{
     const { loginId, password } = req.body;
@@ -197,14 +178,12 @@ app.post("/login", async (req, res) => {
   }
 });
 
-/* ✅ Me */
 app.get("/me", auth, async (req, res) => {
   const user = await User.findOne({ rollNumber: req.user.rollNumber });
   if(!user) return res.status(404).json({ success:false, message:"User not found" });
   res.json({ success:true, user: safeUser(user) });
 });
 
-/* ✅ Enroll */
 app.post("/enroll", auth, async (req, res) => {
   try{
     const { className } = req.body;
@@ -222,25 +201,21 @@ app.post("/enroll", auth, async (req, res) => {
   }
 });
 
-/* ✅ Classes */
 app.get("/classes", auth, async (req, res) => {
   const classes = await ClassModel.find().sort({ name:1 });
   res.json({ success:true, classes });
 });
 
-/* ✅ Subjects */
 app.get("/subjects", auth, async (req, res) => {
   const subjects = await SubjectModel.find().sort({ name:1 });
   res.json({ success:true, subjects });
 });
 
-/* ✅ Student Attendance */
 app.get("/attendance", auth, async (req, res) => {
   const records = await Attendance.find({ rollNumber: req.user.rollNumber }).sort({ date:-1 });
   res.json({ success:true, records });
 });
 
-/* ✅ Profile Update */
 app.post("/profile", auth, async (req, res) => {
   try{
     const update = req.body || {};
@@ -263,7 +238,6 @@ app.post("/profile", auth, async (req, res) => {
   }
 });
 
-/* ✅ Face Enroll */
 app.post("/face/enroll", auth, upload.single("image"), async (req, res) => {
   try{
     if(!req.file){
@@ -279,19 +253,17 @@ app.post("/face/enroll", auth, upload.single("image"), async (req, res) => {
       { new:true }
     );
 
-    res.json({ success:true, message:"Face registered ✅", user: safeUser(user) });
+    res.json({ success:true, user: safeUser(user) });
   }catch(err){
     res.status(500).json({ success:false, message: err.message });
   }
 });
 
-/* ✅ Owner/Staff Users */
 app.get("/owner/users", auth, ownerOrStaff, async (req, res) => {
   const users = await User.find().sort({ createdAt:-1 });
   res.json({ success:true, users: users.map(safeUser) });
 });
 
-/* ✅ Owner/Staff Attendance update */
 app.post("/owner/attendance", auth, ownerOrStaff, async (req, res) => {
   try{
     const { rollNumber, className, status, date } = req.body;
@@ -311,7 +283,6 @@ app.post("/owner/attendance", auth, ownerOrStaff, async (req, res) => {
   }
 });
 
-/* ✅ Attendance list by class+date */
 app.post("/owner/attendance/by-date", auth, ownerOrStaff, async (req, res) => {
   try{
     const { className, date } = req.body;
@@ -326,6 +297,5 @@ app.post("/owner/attendance/by-date", auth, ownerOrStaff, async (req, res) => {
   }
 });
 
-/* ✅ Start */
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log("✅ Server running on port", PORT));
