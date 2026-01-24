@@ -7,9 +7,7 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "@vladmandic/face-api": "^1.7.12",
     "bcryptjs": "^2.4.3",
-    "canvas": "^2.11.2",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
