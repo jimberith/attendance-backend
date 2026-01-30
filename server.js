@@ -1,219 +1,317 @@
-document.addEventListener("DOMContentLoaded", () => {
+import express from "express";
+import mongoose from "mongoose";
+import bcrypt from "bcryptjs";
+import jwt from "jsonwebtoken";
+import cors from "cors";
+import dotenv from "dotenv";
+import multer from "multer";
 
-const API_BASE = "https://attendance-backend-7m9r.onrender.com";
-const TARGET = { lat:11.2742, lng:77.6049, radius:50 };
+dotenv.config();
+const app = express();
+const upload = multer();
 
-const $ = id => document.getElementById(id);
-
-/* =======================
-   POPUP
-======================= */
-function msg(m,t="Message"){
-  popupTitle.textContent=t;
-  popupMessage.textContent=m;
-  popupOverlay.classList.remove("hidden");
-}
-popupOkBtn.onclick=()=>popupOverlay.classList.add("hidden");
+app.use(cors());
+app.use(express.json({ limit: "10mb" }));
 
 /* =======================
-   AUTH STORAGE
+   DATABASE
 ======================= */
-const setToken=t=>localStorage.setItem("token",t);
-const getToken=()=>localStorage.getItem("token");
-const clearToken=()=>localStorage.removeItem("token");
-
-const setUser=u=>localStorage.setItem("user",JSON.stringify(u));
-const getUser=()=>JSON.parse(localStorage.getItem("user")||"null");
-const clearUser=()=>localStorage.removeItem("user");
+mongoose
+  .connect(process.env.MONGO_URI)
+  .then(() => console.log("MongoDB connected"))
+  .catch(err => console.error(err));
 
 /* =======================
-   API
+   MODELS
 ======================= */
-async function apiFetch(path,opt={}){
-  const h=opt.headers||{};
-  if(!(opt.body instanceof FormData)) h["Content-Type"]="application/json";
-  if(getToken()) h.Authorization="Bearer "+getToken();
-  const r=await fetch(API_BASE+path,{...opt,headers:h});
-  return r.json();
-}
+const UserSchema = new mongoose.Schema({
+  name: String,
+  email: String,
+  rollNumber: String,
+  passwordHash: String,
 
-/* =======================
-   AUTH UI
-======================= */
-let authMode="login";
+  role: { type: String, default: "student" },
+  enrolledClass: String,
 
-function setAuthMode(m){
-  authMode=m;
-  showLoginTab.classList.toggle("active",m==="login");
-  showSignupTab.classList.toggle("active",m==="signup");
-  signupFields.classList.toggle("hidden",m!=="signup");
-  loginFields.classList.toggle("hidden",m!=="login");
-  submitAuthBtn.textContent=m==="login"?"Login":"Signup";
-}
+  gender: String,
+  phone: String,
+  dob: String,
+  address: String,
 
-showLoginTab.onclick=()=>setAuthMode("login");
-showSignupTab.onclick=()=>setAuthMode("signup");
+  profilePic: String,
+  faceImage: String,
 
-/* =======================
-   AUTH ACTIONS
-======================= */
-submitAuthBtn.onclick=async()=>{
-  if(authMode==="login"){
-    const loginId=$("loginId").value.trim();
-    const password=$("password").value.trim();
-    if(!loginId||!password) return msg("Fill all fields");
-
-    const d=await apiFetch("/login",{
-      method:"POST",
-      body:JSON.stringify({loginId,password})
-    });
-
-    if(!d.success) return msg(d.message||"Login failed");
-    setToken(d.token);
-    loadApp();
-  }else{
-    const name=$("name").value.trim();
-    const email=$("email").value.trim();
-    const rollNumber=$("rollNumber").value.trim();
-    const password=$("password").value.trim();
-
-    if(!name||!email||!rollNumber||!password)
-      return msg("Fill all fields");
-
-    const d=await apiFetch("/signup",{
-      method:"POST",
-      body:JSON.stringify({name,email,rollNumber,password})
-    });
-
-    if(!d.success) return msg(d.message||"Signup failed");
-    setToken(d.token);
-    loadApp();
+  locks: {
+    profileUpdateLocked: { type: Boolean, default: false },
+    photoUploadLocked: { type: Boolean, default: false },
+    faceRegisterLocked: { type: Boolean, default: false }
   }
-};
-
-/* =======================
-   LOGOUT
-======================= */
-logoutBtn.onclick=()=>{
-  clearToken();
-  clearUser();
-  authSection.classList.remove("hidden");
-  homeSection.classList.add("hidden");
-};
-
-/* =======================
-   NAVIGATION
-======================= */
-function openPage(id){
-  document.querySelectorAll(".page").forEach(p=>p.classList.add("hidden"));
-  $(id).classList.remove("hidden");
-
-  document.querySelectorAll(".nav-item").forEach(b=>b.classList.remove("active"));
-  document.querySelector(`.nav-item[data-page="${id}"]`)?.classList.add("active");
-}
-
-document.querySelectorAll(".nav-item").forEach(btn=>{
-  btn.onclick=()=>{
-    openPage(btn.dataset.page);
-    if(btn.dataset.page==="attendanceRequestsPage") loadRequests();
-  };
 });
 
-/* =======================
-   LOAD APP
-======================= */
-async function loadApp(){
-  if(!getToken()){
-    authSection.classList.remove("hidden");
-    homeSection.classList.add("hidden");
-    return;
-  }
-
-  const me=await apiFetch("/me");
-  if(!me.success){
-    clearToken();
-    return;
-  }
-
-  setUser(me.user);
-  authSection.classList.add("hidden");
-  homeSection.classList.remove("hidden");
-
-  welcomeText.textContent=`Welcome, ${me.user.name}`;
-  roleText.textContent=`Role: ${me.user.role.toUpperCase()}`;
-  enrolledPill.textContent=me.user.enrolledClass||"Not Enrolled";
-
-  if(me.user.role!=="student"){
-    adminNavBlock.classList.remove("hidden");
-    document.querySelectorAll(".admin-only").forEach(x=>x.classList.remove("hidden"));
-  }
-
-  openPage("dashboardPage");
-}
-
-/* =======================
-   FACE + GEO ATTENDANCE
-======================= */
-function dist(a,b,c,d){
-  const R=6371000,toRad=x=>x*Math.PI/180;
-  const dLat=toRad(c-a),dLon=toRad(d-b);
-  return R*2*Math.asin(Math.sqrt(
-    Math.sin(dLat/2)**2+
-    Math.cos(toRad(a))*Math.cos(toRad(c))*Math.sin(dLon/2)**2));
-}
-
-async function captureFace(){
-  const s=await navigator.mediaDevices.getUserMedia({video:true});
-  const v=document.createElement("video");
-  v.srcObject=s;await v.play();
-  await new Promise(r=>setTimeout(r,600));
-  const c=document.createElement("canvas");
-  c.width=v.videoWidth;c.height=v.videoHeight;
-  c.getContext("2d").drawImage(v,0,0);
-  s.getTracks().forEach(t=>t.stop());
-  return await new Promise(r=>c.toBlob(r,"image/jpeg",0.95));
-}
-
-$("faceAttendanceBtn")?.onclick=()=>{
-navigator.geolocation.getCurrentPosition(async p=>{
-  const {latitude,longitude}=p.coords;
-  const d=dist(latitude,longitude,TARGET.lat,TARGET.lng);
-  locationStatus.textContent=`Distance: ${Math.round(d)} m`;
-
-  const img=await captureFace();
-  const fd=new FormData();
-  fd.append("image",img);
-  fd.append("lat",latitude);
-  fd.append("lng",longitude);
-
-  const ep=d<=TARGET.radius?"/attendance/face":"/attendance/request";
-  const r=await apiFetch(ep,{method:"POST",body:fd});
-  msg(r.message,r.success?"Done":"Error");
+const AttendanceSchema = new mongoose.Schema({
+  rollNumber: String,
+  className: String,
+  date: String,
+  status: String
 });
-};
+
+const RequestSchema = new mongoose.Schema({
+  rollNumber: String,
+  className: String,
+  date: String,
+  latitude: Number,
+  longitude: Number,
+  distance: Number,
+  status: { type: String, default: "pending" }
+});
+
+const User = mongoose.model("User", UserSchema);
+const Attendance = mongoose.model("Attendance", AttendanceSchema);
+const Request = mongoose.model("Request", RequestSchema);
 
 /* =======================
-   REQUESTS
+   AUTH HELPERS
 ======================= */
-async function loadRequests(){
-  const d=await apiFetch("/owner/attendance/requests");
-  attendanceRequestsView.innerHTML=d.requests.map(r=>`
-    <div class="user-card">
-      <b>${r.rollNumber}</b> (${Math.round(r.distance)}m)
-      <div class="user-actions">
-        <button class="btn btn-main" onclick="decision('${r._id}',true)">Approve</button>
-        <button class="btn btn-danger" onclick="decision('${r._id}',false)">Reject</button>
-      </div>
-    </div>`).join("");
+function auth(req, res, next) {
+  const h = req.headers.authorization;
+  if (!h) return res.status(401).json({ success: false });
+
+  try {
+    req.user = jwt.verify(h.split(" ")[1], process.env.JWT_SECRET);
+    next();
+  } catch {
+    res.status(401).json({ success: false });
+  }
 }
 
-window.decision=async(id,ok)=>{
-  await apiFetch(
-    ok?"/owner/attendance/request/approve":"/owner/attendance/request/reject",
-    {method:"POST",body:JSON.stringify({requestId:id})}
+function makeToken(user) {
+  return jwt.sign(
+    { rollNumber: user.rollNumber, role: user.role },
+    process.env.JWT_SECRET,
+    { expiresIn: "7d" }
   );
-  loadRequests();
+}
+
+/* =======================
+   GEO DISTANCE
+======================= */
+function distance(lat1, lon1, lat2, lon2) {
+  const R = 6371000;
+  const toRad = d => d * Math.PI / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+
+  return R * 2 * Math.asin(
+    Math.sqrt(
+      Math.sin(dLat / 2) ** 2 +
+      Math.cos(toRad(lat1)) *
+      Math.cos(toRad(lat2)) *
+      Math.sin(dLon / 2) ** 2
+    )
+  );
+}
+
+const CLASS_LOCATION = {
+  lat: 11.2742,
+  lon: 77.6049,
+  radius: 50
 };
 
-loadApp();
+/* =======================
+   AUTH ROUTES
+======================= */
+app.post("/signup", async (req, res) => {
+  const { name, email, rollNumber, password } = req.body;
+  if (!name || !email || !rollNumber || !password)
+    return res.json({ success: false, message: "Missing fields" });
+
+  if (await User.findOne({ $or: [{ email }, { rollNumber }] }))
+    return res.json({ success: false, message: "User exists" });
+
+  const role = (await User.countDocuments()) === 0 ? "owner" : "student";
+
+  const user = await User.create({
+    name,
+    email,
+    rollNumber,
+    passwordHash: await bcrypt.hash(password, 10),
+    role
+  });
+
+  res.json({ success: true, token: makeToken(user) });
 });
+
+app.post("/login", async (req, res) => {
+  const { loginId, password } = req.body;
+
+  const user = await User.findOne({
+    $or: [{ email: loginId }, { rollNumber: loginId }, { name: loginId }]
+  });
+
+  if (!user || !(await bcrypt.compare(password, user.passwordHash)))
+    return res.json({ success: false, message: "Invalid credentials" });
+
+  res.json({ success: true, token: makeToken(user) });
+});
+
+app.get("/me", auth, async (req, res) => {
+  const user = await User.findOne({ rollNumber: req.user.rollNumber });
+  res.json({ success: true, user });
+});
+
+/* =======================
+   PROFILE
+======================= */
+app.post("/profile", auth, async (req, res) => {
+  const user = await User.findOne({ rollNumber: req.user.rollNumber });
+
+  if (user.locks?.profileUpdateLocked)
+    return res.json({ success: false, message: "Profile locked" });
+
+  const {
+    name, rollNumber, gender,
+    phone, dob, address, password, profilePic
+  } = req.body;
+
+  if (name !== undefined) user.name = name;
+  if (rollNumber !== undefined) user.rollNumber = rollNumber;
+  if (gender !== undefined) user.gender = gender;
+  if (phone !== undefined) user.phone = phone;
+  if (dob !== undefined) user.dob = dob;
+  if (address !== undefined) user.address = address;
+  if (profilePic !== undefined) user.profilePic = profilePic;
+
+  if (password)
+    user.passwordHash = await bcrypt.hash(password, 10);
+
+  await user.save();
+  res.json({ success: true, user });
+});
+
+/* =======================
+   FACE REGISTER
+======================= */
+app.post("/face/enroll", auth, upload.single("image"), async (req, res) => {
+  const user = await User.findOne({ rollNumber: req.user.rollNumber });
+
+  if (user.locks?.faceRegisterLocked)
+    return res.json({ success: false, message: "Face register locked" });
+
+  user.faceImage = req.file.buffer.toString("base64");
+  await user.save();
+
+  res.json({ success: true, user });
+});
+
+/* =======================
+   ATTENDANCE (FACE + GEO)
+======================= */
+app.post("/attendance/face", auth, upload.single("image"), async (req, res) => {
+  const user = await User.findOne({ rollNumber: req.user.rollNumber });
+  const { lat, lng } = req.body;
+
+  const d = distance(
+    Number(lat),
+    Number(lng),
+    CLASS_LOCATION.lat,
+    CLASS_LOCATION.lon
+  );
+
+  const date = new Date().toISOString().split("T")[0];
+
+  if (d <= CLASS_LOCATION.radius) {
+    await Attendance.create({
+      rollNumber: user.rollNumber,
+      className: user.enrolledClass,
+      date,
+      status: "Present"
+    });
+    return res.json({ success: true, message: "Attendance marked" });
+  }
+
+  res.json({ success: false, message: "Out of range" });
+});
+
+/* =======================
+   ATTENDANCE REQUEST
+======================= */
+app.post("/attendance/request", auth, upload.single("image"), async (req, res) => {
+  const user = await User.findOne({ rollNumber: req.user.rollNumber });
+  const { lat, lng } = req.body;
+
+  const d = distance(
+    Number(lat),
+    Number(lng),
+    CLASS_LOCATION.lat,
+    CLASS_LOCATION.lon
+  );
+
+  const date = new Date().toISOString().split("T")[0];
+
+  await Request.create({
+    rollNumber: user.rollNumber,
+    className: user.enrolledClass,
+    date,
+    latitude: lat,
+    longitude: lng,
+    distance: d
+  });
+
+  res.json({ success: true, message: "Request sent" });
+});
+
+/* =======================
+   ADMIN – REQUESTS
+======================= */
+app.get("/owner/attendance/requests", auth, async (req, res) => {
+  if (req.user.role === "student")
+    return res.json({ success: false });
+
+  const requests = await Request.find({ status: "pending" });
+  res.json({ success: true, requests });
+});
+
+app.post("/owner/attendance/request/approve", auth, async (req, res) => {
+  if (req.user.role === "student")
+    return res.json({ success: false });
+
+  const { requestId } = req.body;
+  const r = await Request.findById(requestId);
+
+  await Attendance.create({
+    rollNumber: r.rollNumber,
+    className: r.className,
+    date: r.date,
+    status: "Present"
+  });
+
+  r.status = "done";
+  await r.save();
+  res.json({ success: true });
+});
+
+app.post("/owner/attendance/request/reject", auth, async (req, res) => {
+  if (req.user.role === "student")
+    return res.json({ success: false });
+
+  const { requestId } = req.body;
+  const r = await Request.findById(requestId);
+
+  await Attendance.create({
+    rollNumber: r.rollNumber,
+    className: r.className,
+    date: r.date,
+    status: "Absent"
+  });
+
+  r.status = "done";
+  await r.save();
+  res.json({ success: true });
+});
+
+/* =======================
+   SERVER
+======================= */
+app.listen(10000, () =>
+  console.log("ATTENDIFY backend running on port 10000")
+);
