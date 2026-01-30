@@ -1,190 +1,211 @@
 import express from "express";
-import cors from "cors";
 import mongoose from "mongoose";
-import dotenv from "dotenv";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+import cors from "cors";
+import dotenv from "dotenv";
 import multer from "multer";
-import canvas from "canvas";
-import * as faceapi from "@vladmandic/face-api";
 
 dotenv.config();
 const app = express();
-const upload = multer({ limits:{ fileSize: 5 * 1024 * 1024 } });
+const upload = multer();
 
-app.use(cors({ origin:"*", methods:["GET","POST"], allowedHeaders:["Content-Type","Authorization"] }));
-app.use(express.json({ limit:"8mb" }));
+app.use(cors());
+app.use(express.json({ limit: "10mb" }));
 
-const JWT_SECRET = process.env.JWT_SECRET || "SECRET";
-mongoose.connect(process.env.MONGO_URI);
+/* =======================
+   DB
+======================= */
+mongoose.connect(process.env.MONGO_URI)
+  .then(()=>console.log("MongoDB connected"))
+  .catch(err=>console.log(err));
 
-const { Canvas, Image, ImageData } = canvas;
-faceapi.env.monkeyPatch({ Canvas, Image, ImageData });
-
-await faceapi.nets.ssdMobilenetv1.loadFromDisk("./models");
-await faceapi.nets.faceLandmark68Net.loadFromDisk("./models");
-await faceapi.nets.faceRecognitionNet.loadFromDisk("./models");
-
-/* ================= SCHEMAS ================= */
-const User = mongoose.model("User", new mongoose.Schema({
+/* =======================
+   MODELS
+======================= */
+const UserSchema = new mongoose.Schema({
   name:String,
   email:String,
   rollNumber:String,
   passwordHash:String,
-  role:String,
+  role:{ type:String, default:"student" },
   enrolledClass:String,
-  faceDescriptor:[Number],
-  profilePic:String
-}));
-
-const ClassModel = mongoose.model("Class", new mongoose.Schema({
-  name:String,
-  latitude:Number,
-  longitude:Number,
-  radius:Number
-}));
-
-const Attendance = mongoose.model("Attendance", new mongoose.Schema({
+  profilePic:String,
+  faceImage:String
+});
+const AttendanceSchema = new mongoose.Schema({
   rollNumber:String,
   className:String,
   date:String,
-  status:String,
-  markedBy:String
-}));
-
-const AttendanceRequest = mongoose.model("AttendanceRequest", new mongoose.Schema({
-  rollNumber:String,
-  className:String,
-  date:String,
-  latitude:Number,
-  longitude:Number,
   status:String
-}));
+});
+const RequestSchema = new mongoose.Schema({
+  rollNumber:String,
+  className:String,
+  date:String,
+  latitude:Number,
+  longitude:Number,
+  status:{ type:String, default:"pending" }
+});
 
-/* ================= AUTH ================= */
+const User = mongoose.model("User",UserSchema);
+const Attendance = mongoose.model("Attendance",AttendanceSchema);
+const Request = mongoose.model("Request",RequestSchema);
+
+/* =======================
+   AUTH
+======================= */
 function auth(req,res,next){
   const h = req.headers.authorization;
   if(!h) return res.status(401).json({success:false});
   try{
-    req.user = jwt.verify(h.split(" ")[1], JWT_SECRET);
+    req.user = jwt.verify(h.split(" ")[1],process.env.JWT_SECRET);
     next();
-  }catch{ return res.status(401).json({success:false}); }
+  }catch{
+    res.status(401).json({success:false});
+  }
 }
 
-function token(u){
-  return jwt.sign({ rollNumber:u.rollNumber, role:u.role }, JWT_SECRET);
+function token(user){
+  return jwt.sign(
+    { rollNumber:user.rollNumber, role:user.role },
+    process.env.JWT_SECRET,
+    { expiresIn:"7d" }
+  );
 }
 
-function dist(a,b){
-  return Math.sqrt(a.reduce((s,v,i)=>s+(v-b[i])**2,0));
-}
+/* =======================
+   ROUTES
+======================= */
 
-function geo(lat1,lon1,lat2,lon2){
+/* Signup */
+app.post("/signup",async(req,res)=>{
+  const {name,email,rollNumber,password}=req.body;
+  if(!name||!email||!rollNumber||!password)
+    return res.json({success:false,message:"Missing fields"});
+
+  if(await User.findOne({$or:[{email},{rollNumber}]}))
+    return res.json({success:false,message:"User exists"});
+
+  const count = await User.countDocuments();
+  const role = count===0?"owner":"student";
+
+  const user = await User.create({
+    name,email,rollNumber,
+    passwordHash:await bcrypt.hash(password,10),
+    role
+  });
+
+  res.json({success:true,token:token(user)});
+});
+
+/* Login */
+app.post("/login",async(req,res)=>{
+  const {loginId,password}=req.body;
+  const user = await User.findOne({
+    $or:[{email:loginId},{rollNumber:loginId},{name:loginId}]
+  });
+  if(!user) return res.json({success:false,message:"Invalid"});
+
+  if(!await bcrypt.compare(password,user.passwordHash))
+    return res.json({success:false,message:"Invalid"});
+
+  res.json({success:true,token:token(user)});
+});
+
+/* Me */
+app.get("/me",auth,async(req,res)=>{
+  const user = await User.findOne({rollNumber:req.user.rollNumber});
+  res.json({success:true,user});
+});
+
+/* =======================
+   PROFILE
+======================= */
+app.post("/profile",auth,async(req,res)=>{
+  const user = await User.findOne({rollNumber:req.user.rollNumber});
+  Object.assign(user,req.body);
+  await user.save();
+  res.json({success:true,user});
+});
+
+/* =======================
+   FACE REGISTER
+======================= */
+app.post("/face/register",auth,upload.single("image"),async(req,res)=>{
+  const user = await User.findOne({rollNumber:req.user.rollNumber});
+  user.faceImage = req.file.buffer.toString("base64");
+  await user.save();
+  res.json({success:true});
+});
+
+/* =======================
+   ATTENDANCE
+======================= */
+function distance(lat1,lon1,lat2,lon2){
   const R=6371000;
   const dLat=(lat2-lat1)*Math.PI/180;
   const dLon=(lon2-lon1)*Math.PI/180;
-  const a=Math.sin(dLat/2)**2+
-    Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*
-    Math.sin(dLon/2)**2;
-  return R*2*Math.atan2(Math.sqrt(a),Math.sqrt(1-a));
+  return R*2*Math.asin(Math.sqrt(
+    Math.sin(dLat/2)**2+
+    Math.cos(lat1*Math.PI/180)*
+    Math.cos(lat2*Math.PI/180)*
+    Math.sin(dLon/2)**2
+  ));
 }
 
-/* ================= ROUTES ================= */
-app.post("/signup", async(req,res)=>{
-  const { name,email,rollNumber,password } = req.body;
-  const count = await User.countDocuments();
-  const user = await User.create({
-    name,email,rollNumber,
-    passwordHash: await bcrypt.hash(password,10),
-    role: count===0 ? "owner" : "student"
-  });
-  res.json({ success:true, token:token(user), user });
-});
+/* Auto attendance */
+app.post("/attendance/auto",auth,upload.single("image"),async(req,res)=>{
+  const user = await User.findOne({rollNumber:req.user.rollNumber});
+  const {latitude,longitude}=req.body;
+  const date=new Date().toISOString().split("T")[0];
 
-app.post("/login", async(req,res)=>{
-  const { loginId,password } = req.body;
-  const u = await User.findOne({
-    $or:[{email:loginId},{rollNumber:loginId},{name:loginId}]
-  });
-  if(!u || !await bcrypt.compare(password,u.passwordHash))
-    return res.json({success:false});
-  res.json({ success:true, token:token(u), user:u });
-});
+  const CLASS_LAT=11.0168;
+  const CLASS_LON=76.9558;
 
-app.get("/me", auth, async(req,res)=>{
-  const u = await User.findOne({ rollNumber:req.user.rollNumber });
-  res.json({ success:true, user:u });
-});
-
-/* ========== FACE REGISTER ========== */
-app.post("/face/register", auth, upload.single("image"), async(req,res)=>{
-  const img = await canvas.loadImage(req.file.buffer);
-  const det = await faceapi.detectSingleFace(img).withFaceLandmarks().withFaceDescriptor();
-  if(!det) return res.json({success:false});
-  await User.updateOne(
-    { rollNumber:req.user.rollNumber },
-    { faceDescriptor:Array.from(det.descriptor) }
-  );
-  res.json({ success:true });
-});
-
-/* ========== AUTO ATTENDANCE ========== */
-app.post("/attendance/auto", auth, upload.single("image"), async(req,res)=>{
-  const { latitude,longitude } = req.body;
-  const date = new Date().toISOString().split("T")[0];
-  const u = await User.findOne({ rollNumber:req.user.rollNumber });
-  const cls = await ClassModel.findOne({ name:u.enrolledClass });
-  if(!u.faceDescriptor) return res.json({success:false});
-
-  const img = await canvas.loadImage(req.file.buffer);
-  const det = await faceapi.detectSingleFace(img).withFaceLandmarks().withFaceDescriptor();
-  if(!det || dist(det.descriptor,u.faceDescriptor)>0.55)
-    return res.json({success:false});
-
-  const meters = geo(latitude,longitude,cls.latitude,cls.longitude);
-
-  if(meters<=cls.radius){
-    await Attendance.findOneAndUpdate(
-      { rollNumber:u.rollNumber,date },
-      { rollNumber:u.rollNumber,className:u.enrolledClass,date,status:"Present",markedBy:"auto" },
-      { upsert:true }
-    );
-    return res.json({ success:true, auto:true });
+  if(distance(latitude,longitude,CLASS_LAT,CLASS_LON)<=50){
+    await Attendance.create({
+      rollNumber:user.rollNumber,
+      className:user.enrolledClass,
+      date,
+      status:"Present"
+    });
+    return res.json({success:true,auto:true});
   }
 
-  await AttendanceRequest.create({
-    rollNumber:u.rollNumber,
-    className:u.enrolledClass,
-    date,latitude,longitude,status:"pending"
+  await Request.create({
+    rollNumber:user.rollNumber,
+    className:user.enrolledClass,
+    date,
+    latitude,longitude
   });
-  res.json({ success:true, auto:false });
+  res.json({success:true,auto:false});
 });
 
-/* ========== REQUESTS ========== */
-app.get("/owner/attendance/requests", auth, async(req,res)=>{
-  if(!["owner","staff"].includes(req.user.role)) return res.json({success:false});
-  res.json({ success:true, requests: await AttendanceRequest.find({status:"pending"}) });
+/* Requests */
+app.get("/owner/attendance/requests",auth,async(req,res)=>{
+  if(req.user.role==="student") return res.json({success:false});
+  const r = await Request.find({status:"pending"});
+  res.json({success:true,requests:r});
 });
 
-app.post("/owner/attendance/decision", auth, async(req,res)=>{
-  if(!["owner","staff"].includes(req.user.role)) return res.json({success:false});
-  const { requestId,approve } = req.body;
-  const r = await AttendanceRequest.findById(requestId);
-  if(!r) return res.json({success:false});
-  r.status = approve ? "approved":"rejected";
+/* Decision */
+app.post("/owner/attendance/decision",auth,async(req,res)=>{
+  if(req.user.role==="student") return res.json({success:false});
+  const {requestId,approve}=req.body;
+  const r = await Request.findById(requestId);
+  await Attendance.create({
+    rollNumber:r.rollNumber,
+    className:r.className,
+    date:r.date,
+    status:approve?"Present":"Absent"
+  });
+  r.status="done";
   await r.save();
-  await Attendance.findOneAndUpdate(
-    { rollNumber:r.rollNumber,date:r.date },
-    {
-      rollNumber:r.rollNumber,
-      className:r.className,
-      date:r.date,
-      status: approve?"Present":"Absent",
-      markedBy:req.user.role
-    },
-    { upsert:true }
-  );
-  res.json({ success:true });
+  res.json({success:true});
 });
 
-app.listen(10000);
+/* =======================
+   SERVER
+======================= */
+app.listen(10000,()=>console.log("Server running on 10000"));
